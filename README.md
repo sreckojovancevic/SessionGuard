@@ -258,6 +258,6 @@ browser state; SessionGuard keeps it local, hardware-bound and policy-gated,
 then supplies it only at request time.**
 
 ## License
+APACHE 2.0 
 
-No license has been selected yet. Until a license is added to the repository,
-the source should be treated as all-rights-reserved by default.
+Copyright 2026 Srecko Jovancevic
