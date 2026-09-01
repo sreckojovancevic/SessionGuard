@@ -6,6 +6,27 @@ them in a local vault protected by a TPM-backed key. A protected cookie is
 attached to an outbound request only when the local authorization policy allows
 it.
 
+## Why this exists
+
+SessionGuard started from a real incident: a session from my TikTok account was
+stolen and subsequently used by someone else to access the account and run
+their own LIVE.
+
+The problem was not that the password was known. The problem was that the
+session itself had become the credential. Once the session cookie was outside
+the original browser environment, the service had no reason to distinguish the
+attacker from the legitimate session.
+
+That led to a simple question:
+
+> What if the browser never had the protected session credential in the first
+> place?
+
+SessionGuard is an experiment around that question. Instead of allowing the
+browser to persist the protected session cookie as ordinary browser state, the
+cookie is kept in a local vault and supplied only when an authorized request
+needs it.
+
 The design is intentionally local: the service being accessed does not need to
 implement a new session protocol.
 
@@ -248,8 +269,8 @@ so on Windows add these to `C:\Windows\System32\drivers\etc\hosts` first:
 
 Core and the suite build and run on any .NET 8 platform. The Windows project
 needs Windows tooling; five of its files are additionally type-checked against
-`net8.0` in isolation, and `WindowsHello.cs` plus the XAML are only validated by
-building on Windows.
+`net8.0` in isolation, and `WindowsHello.cs` plus the XAML are only validated
+by building on Windows.
 
 ## Security model in one sentence
 
@@ -258,6 +279,7 @@ browser state; SessionGuard keeps it local, hardware-bound and policy-gated,
 then supplies it only at request time.**
 
 ## License
-APACHE 2.0 
+
+APACHE 2.0
 
 Copyright 2026 Srecko Jovancevic
