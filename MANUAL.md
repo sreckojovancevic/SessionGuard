@@ -1,0 +1,728 @@
+# SessionGuard — User Manual
+
+This manual explains how to build, start, configure and use the current Windows
+prototype.
+
+> **Experimental software:** this is a security prototype, not an audited
+> security product. Read the limitations before using it with an important
+> account.
+
+---
+
+## 1. What SessionGuard is doing
+
+Normally a browser stores a session cookie in its profile:
+
+```text
+login
+  -> Set-Cookie
+  -> browser cookie jar
+  -> every later request carries Cookie:
+```
+
+SessionGuard changes that path for explicitly protected hosts:
+
+```text
+login
+  -> Set-Cookie
+  -> SessionGuard captures it
+  -> local TPM-backed vault
+  -> browser does not keep the protected session cookie
+
+later request
+  -> SessionGuard checks the local lease/process policy
+  -> Cookie header is added immediately before upstream delivery
+```
+
+Hosts that are not protected are not intercepted:
+
+```text
+browser -> CONNECT tunnel -> Internet
+```
+
+---
+
+## 2. First build
+
+Open PowerShell in the repository root.
+
+### Normal build
+
+```powershell
+dotnet build .\SessionGuard.sln -c Release
+```
+
+### Run from source
+
+```powershell
+dotnet run --project .\src\SessionGuard.Windows -c Release
+```
+
+### Self-contained Windows x64 package
+
+This creates a publish directory containing the executable and the required
+.NET runtime files:
+
+```powershell
+dotnet publish .\src\SessionGuard.Windows `
+  -c Release `
+  -r win-x64 `
+  --self-contained true
+```
+
+Output:
+
+```text
+src\SessionGuard.Windows\bin\Release\
+net8.0-windows10.0.19041.0\
+win-x64\
+publish\
+```
+
+The executable is:
+
+```text
+SessionGuard.exe
+```
+
+For Windows ARM64:
+
+```powershell
+dotnet publish .\src\SessionGuard.Windows `
+  -c Release `
+  -r win-arm64 `
+  --self-contained true
+```
+
+No solution or source-file changes are required just to select x64 versus
+ARM64 at publish time.
+
+---
+
+## 3. Starting SessionGuard
+
+Start the application with:
+
+```powershell
+dotnet run --project .\src\SessionGuard.Windows -c Release
+```
+
+or launch `SessionGuard.exe` from the publish directory.
+
+The application is per-user. It modifies the current user's Windows Internet
+Settings and current-user certificate store.
+
+If a previous run died while the system proxy was enabled, SessionGuard looks
+for its saved proxy-state marker at startup and attempts to restore the previous
+settings before doing anything else.
+
+---
+
+## 4. Configure the hosts you want to protect
+
+In the **Protected hosts** box enter the hostname(s) to intercept.
+
+Examples:
+
+```text
+example.com
+```
+
+or:
+
+```text
+login.example.com, api.example.com
+```
+
+or:
+
+```text
+*.tiktok.com
+```
+
+Press **Save**.
+
+### Host syntax
+
+Use hostnames, not schemes or paths. The UI accepts common pasted URL forms and
+normalizes them, so these can be entered as well:
+
+```text
+https://example.com/login
+example.com:443
+```
+
+A plain entry is exact:
+
+```text
+example.com
+```
+
+A wildcard entry beginning with `*.` covers the bare domain and its
+subdomains:
+
+```text
+*.example.com
+```
+
+The stored file is:
+
+```text
+%LOCALAPPDATA%\SessionGuard\protected-hosts.txt
+```
+
+If you change the host list while the Guard is already on, turn the Guard off
+and on again. The UI reports this explicitly.
+
+---
+
+## 5. Turn the Guard on
+
+Press **Turn on**.
+
+The sequence is:
+
+1. It ensures the local SessionGuard root CA is trusted by the current Windows
+   user. On first use you will be asked for consent.
+2. It starts the local proxy on:
+
+   ```text
+   127.0.0.1:28080
+   ```
+
+3. It changes the Windows user's system proxy to that endpoint.
+4. All traffic using the Windows system proxy now passes through SessionGuard.
+
+The TPM-backed vault is opened earlier, when the application starts — not here.
+If it is unavailable, **Turn on** is disabled from the outset and the header
+reads `PROTECTED MODE UNAVAILABLE`.
+
+The application saves the previous proxy settings before changing them.
+
+### Verify the proxy
+
+In PowerShell:
+
+```powershell
+Get-NetTCPConnection -LocalPort 28080 -ErrorAction SilentlyContinue |
+    Format-Table LocalAddress,LocalPort,State,OwningProcess
+```
+
+You should see a `Listen` entry for `127.0.0.1:28080`.
+
+You can also inspect the current user's WinINET settings:
+
+```powershell
+Get-ItemProperty `
+  'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' |
+  Select-Object ProxyEnable,ProxyServer,ProxyOverride
+```
+
+Expected while the Guard is on:
+
+```text
+ProxyEnable : 1
+ProxyServer : 127.0.0.1:28080
+```
+
+---
+
+## 6. Browser selection
+
+Start the browser before pressing **Refresh**.
+
+SessionGuard scans for known browser process names:
+
+```text
+chrome
+msedge
+brave
+vivaldi
+opera
+opera_gx
+firefox
+```
+
+It does **not** use `MainWindowHandle` as the selector. Instead it builds a
+process tree and offers browser roots to the user.
+
+A typical result looks like:
+
+```text
+28 browser process(es), 2 root(s)
+```
+
+The browser selector is editable. If automatic enumeration ever fails, read
+the PID from **Task Manager -> Details** and type it directly.
+
+### Why the root process matters
+
+Chromium browsers commonly have several processes. The process owning the
+actual socket can be a child network-service process. SessionGuard therefore
+authorizes the selected browser process **and its descendants**, while still
+rejecting an unrelated process.
+
+The lease is also pinned to the selected process's identity and start time so a
+recycled PID does not automatically inherit the old lease.
+
+---
+
+## 7. Presence / Unlock policy
+
+### Three independent layers
+
+The most common misunderstanding is that the **Check** setting decides whether
+your session is protected. It does not. Three separate things are going on.
+
+**Layer 1 — the vault, and non-exportability.** Active whenever the Guard is on
+and the host is in your list. Independent of the Check setting and of whether a
+lease is open. `Set-Cookie` is captured, sealed with the TPM key and removed
+from the response, so the browser profile never holds it. Non-exportability
+comes from `ExportPolicy.None` on the TPM key.
+
+> You will see the Vault fill up while the UI still says **Locked**. That is
+> correct: capture does not need a lease.
+
+**Layer 2 — the lease.** Decides whether a stored cookie is put *back* into
+outgoing requests, for whom, and for how long. It is pinned to the browser
+process you select **and all of its descendants** — not to a tab, a site or a
+login. One lease covers the whole browser and every protected host at once.
+
+Descendants matter: Chromium makes its connections from a child
+network-service process, so pinning only the visible process would reject the
+browser you just authorized.
+
+**Layer 3 — the Check setting.** Decides only what it costs you to open the
+lease. It does not change the vault, non-exportability, or the reach of the
+lease.
+
+| Check | At Unlock | While browsing |
+|---|---|---|
+| **Windows Hello gesture** | biometric or PIN gesture | nothing |
+| **TPM consent prompt (per use)** | a click | a Windows prompt per cookie, per request |
+| **None** | a click | nothing |
+
+### The Check setting drives the TPM key policy
+
+The per-use prompt is a property of the TPM key (`CngUIPolicy.ProtectKey`), not
+of an application setting. Selecting a mode therefore determines how the key is
+created:
+
+```text
+Windows Hello    -> key without UI policy
+TPM consent      -> key with per-use ProtectKey policy
+None             -> key without UI policy
+```
+
+A key created by an earlier run keeps its own policy regardless of what the UI
+now says. When that happens the sealer line reports the mismatch, for example:
+
+```text
+key has per-use consent, mode wants no per-use consent
+```
+
+Press **Reset key** to delete the TPM key and recreate it for the selected mode.
+This makes anything currently in the vault unreadable, so you will have to log
+in to protected sites again. Since the vault is in-process and lost on exit
+anyway, that costs nothing beyond the current session.
+
+### Practical note on TPM consent
+
+The prompt fires on every private-key operation, and the vault unseals **once
+per cookie per request**. A site with three session cookies therefore produces
+three Windows dialogs for every HTTP request. This is a deliberate, very strong
+per-use authorization, and it is not usable for ordinary browsing. Treat it as
+a mode for occasional, high-value access rather than a daily default.
+
+### Windows Hello
+
+If verification fails, the lease remains closed. SessionGuard does not silently
+downgrade to an unverified lease.
+
+> The current Windows Hello integration is experimental. If it does not work on
+> your machine, use None while testing the rest of the system.
+
+### None
+
+Unlock is an ordinary button click. This does **not** remove the rest of the
+authorization model. The lease still:
+
+- expires after the configured period,
+- is pinned to the selected process,
+- follows the process lineage rules,
+- controls whether protected session cookies are injected.
+
+What is missing is proof that a person did it. Malware able to drive the UI, or
+malware that simply waits for you to unlock, rides on the open lease.
+
+## 8. Unlocking a browser
+
+After selecting the browser and the desired presence policy, press **Unlock**.
+
+A successful unlock opens the lease for the configured duration (15 minutes by
+default in the current prototype).
+
+The UI will show something similar to:
+
+```text
+Unlocked for pid 6068 and its children — 14:59 remaining
+```
+
+When the lease expires:
+
+```text
+Locked — requests go out without the session
+```
+
+This is intentional. **Expiration of the lease must not disconnect the browser
+from the Internet.** It only stops SessionGuard from attaching the protected
+session credential.
+
+---
+
+## 9. Log in to a protected site
+
+Once the Guard is on and the browser lease is open:
+
+1. Navigate to a hostname listed under **Protected hosts**.
+2. Log in normally.
+3. The site's `Set-Cookie` response is parsed by SessionGuard.
+4. Session cookies are stored in the vault rather than left in the browser's
+   ordinary cookie jar.
+5. Later requests from the authorized browser process receive the appropriate
+   `Cookie` header at the proxy immediately before upstream delivery.
+
+The **Vault** panel should change from:
+
+```text
+empty
+```
+
+to entries such as:
+
+```text
+example.com: sessionid, csrf
+```
+
+The exact cookie names depend on the site.
+
+---
+
+## 10. Cookie scope and logout
+
+SessionGuard models the important cookie scope rules needed for this design.
+
+### Domain
+
+A cookie with:
+
+```text
+Domain=.example.com
+```
+
+can be used for matching subdomains according to cookie domain matching.
+
+A host-only cookie remains associated with the host that set it.
+
+### Path
+
+A cookie with:
+
+```text
+Path=/admin
+```
+
+is not sent to:
+
+```text
+/cookies
+```
+
+### Sign-out
+
+If a service sends an expiry/delete cookie such as `Max-Age=0`, SessionGuard
+removes the corresponding vault entry instead of preserving a dead credential.
+
+The expiry header itself is removed along with the other `Set-Cookie` headers:
+the browser holds no copy of the protected cookie, so there is nothing there to
+delete.
+
+A `Set-Cookie` whose `Domain` the sending host is not entitled to claim is a
+different case. SessionGuard refuses to vault it and **passes the header
+through untouched**, leaving the decision to the browser. Refusing to store
+something must not mean destroying it.
+
+---
+
+## 11. Firefox
+
+Firefox can use the system proxy, but it maintains its own certificate trust
+store.
+
+If a protected HTTPS site reports a certificate error in Firefox, use one of
+the following approaches:
+
+1. Enable Firefox's enterprise-root integration, or
+2. Import the SessionGuard root certificate into Firefox's trusted authorities.
+
+SessionGuard logs a reminder when Firefox is selected.
+
+The Windows root CA installation performed by SessionGuard is therefore not
+necessarily enough for Firefox's certificate validation.
+
+---
+
+## 12. Turn the Guard off
+
+Press **Turn off**.
+
+SessionGuard will:
+
+1. restore the user's previous Windows proxy settings,
+2. stop the proxy listener,
+3. close the active lease.
+
+The proxy state is stored before the registry is changed so that a crash can be
+reconciled on the next startup.
+
+If the application is killed hard or the machine loses power, `ProcessExit`
+may not run. This is why the persistent recovery marker exists.
+
+---
+
+## 13. Forget all sessions
+
+Press **Forget all** in the Vault panel.
+
+This clears the in-process session vault.
+
+Because the vault is deliberately non-persistent at the application level,
+exiting SessionGuard also loses the current session material.
+
+---
+
+## 14. Where SessionGuard stores local state
+
+Current-user data is under:
+
+```text
+%LOCALAPPDATA%\SessionGuard\
+```
+
+Important files include:
+
+```text
+protected-hosts.txt
+settings.json
+proxy-state.json       # only while a proxy change is active/recoverable
+```
+
+The TPM wrapping key is held by the Windows CNG Microsoft Platform Crypto
+Provider rather than being exported as an ordinary private-key file.
+
+The local CA private key is protected with DPAPI under the current Windows
+account.
+
+Do not copy these files to another machine and expect the vault to work. The
+TPM-backed key is intentionally machine-bound.
+
+---
+
+## 15. Development-only insecure mode
+
+If the machine does not have a usable TPM, normal protected mode refuses to
+start.
+
+For development/testing only:
+
+```powershell
+dotnet run --project .\src\SessionGuard.Windows -c Release -- --allow-insecure-dev-mode
+```
+
+The UI will explicitly say that the vault is RAM-only and insecure.
+
+Do not use this mode to protect a real account.
+
+---
+
+## 16. Troubleshooting
+
+### `An attempt was made to access a socket in a way forbidden by its access permissions`
+
+This normally means the listener port is unavailable.
+
+Current port:
+
+```text
+28080
+```
+
+Check it:
+
+```powershell
+Get-NetTCPConnection -LocalPort 28080 -ErrorAction SilentlyContinue
+```
+
+If necessary, check Windows excluded port ranges:
+
+```powershell
+netsh interface ipv4 show excludedportrange protocol=tcp
+```
+
+### Browser list is empty
+
+Press **Refresh** after starting the browser.
+
+If necessary, use Task Manager -> Details and type the browser PID directly.
+
+The scan text and log now report the number of browser processes and roots and
+list PID/PPID information for diagnosis.
+
+### Guard is on but the protected site does not work
+
+Check:
+
+1. The exact hostname is in **Protected hosts**.
+2. The browser is using the Windows/system proxy.
+3. The SessionGuard root CA is trusted by the browser.
+4. The lease is open.
+5. The site does not use certificate pinning.
+6. The site stores its authentication token in cookies rather than
+   `localStorage`/IndexedDB.
+
+### `Could not verify your presence`
+
+This is the current Windows Hello integration failing closed.
+
+For testing, change **Check** to:
+
+```text
+None — unlock is just a click
+```
+
+TPM consent also avoids the gesture, but replaces it with a Windows prompt on
+every cookie of every request, which is impractical for browsing.
+
+Either way this does not mean the TPM vault itself is unavailable: the vault and
+its non-exportability do not depend on the presence mode.
+
+### Internet disappears after an abnormal shutdown
+
+SessionGuard is designed to recover a stale proxy marker at startup. If the
+machine is already stuck behind a dead proxy, use:
+
+```powershell
+Get-ItemProperty `
+  'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' |
+  Select-Object ProxyEnable,ProxyServer,ProxyOverride
+```
+
+As an emergency user-level reset, disable the Windows proxy in Windows Settings
+or Internet Options, then restart SessionGuard so it can reconcile its marker.
+
+---
+
+## 17. What SessionGuard does not protect
+
+This prototype is intentionally narrower than a general browser-security
+system.
+
+It does not prevent code running inside an already-authorized browser from
+using the live session. JavaScript does not need to steal a cookie if it can
+already perform authenticated actions through the browser.
+
+It does not protect tokens stored in:
+
+```text
+localStorage
+IndexedDB
+service-worker/application state
+```
+
+It also does not make a compromised Windows user account trustworthy. PID
+lineage is useful defence in depth, but a sufficiently privileged attacker in
+the same user context can manipulate process relationships and interact with
+local security APIs.
+
+The core property being pursued is narrower:
+
+> **A copied browser profile should not contain the protected session cookie in
+> a form that can simply be exported and replayed elsewhere.**
+
+---
+
+## 18. Current test coverage
+
+The end-to-end suite is a console application, not a unit-test project, so it
+is run rather than tested:
+
+```powershell
+dotnet run --project .\tests\SessionGuard.E2E
+```
+
+> `dotnet test` reports no tests for this solution. There is no test framework
+> referenced; the suite drives a real proxy, a real mock service and real
+> separate OS processes, and prints its own results.
+
+> The suite adds temporary entries to the hosts file and currently only handles
+> the Unix path (`/etc/hosts`). On Windows, add these to
+> `C:\Windows\System32\drivers\etc\hosts` by hand first:
+>
+> ```text
+> 127.0.0.1 api.example.test
+> 127.0.0.1 other.example.test
+> 127.0.0.1 login.sg.test
+> 127.0.0.1 api2.sg.test
+> ```
+
+40 checks currently pass, covering:
+
+- byte-level header editing, including `Cookie` not matching `Set-Cookie`
+- `Set-Cookie` parsed to name and value, attributes discarded
+- login through the guard; the browser jar left without the session
+- several `Set-Cookie` values in one response
+- keep-alive: repeated requests on one connection
+- `Content-Length` and chunked framing, and a request body containing a header
+  line arriving byte-exact
+- untouched tunnelled hosts
+- no-lease behaviour: 401 from the service, with the connection still working
+- process lineage: a descendant authorized, an unrelated process refused
+- cookie `Path` scoping
+- wildcard hosts: `*.tiktok.com` matching and not over-matching
+- cookie `Domain` scoping across subdomains, host-only cookies staying put
+- a cookie scoped to someone else's domain refused, its header still delivered
+- sign-out via `Max-Age=0`
+- vault sealing and round-trip
+
+The Windows GUI and security integration are platform-specific and must be
+validated on the Windows machine where they will run.
+
+## 19. Recommended test sequence
+
+For a clean first test, use this order:
+
+```text
+1. Build
+2. Start SessionGuard
+3. Configure one protected host
+4. Turn on
+5. Confirm 127.0.0.1:28080 is listening
+6. Start/refresh browser
+7. Refresh browser list
+8. Select browser PID
+9. Set Check = None for the first end-to-end test
+10. Unlock
+11. Login to the protected site
+12. Check Vault
+13. Make several authenticated requests
+14. Turn off
+15. Confirm system proxy is restored
+16. Press Reset key, then repeat with TPM consent
+    (expect a prompt per cookie per request)
+17. Finally test Windows Hello
+```
+
+Starting with `None` isolates the proxy/vault/process path from the experimental
+Hello integration. Once that path is proven, enable the stronger presence
+policies one at a time — remembering that switching to or from TPM consent needs
+**Reset key** to take effect, because the policy lives on the key.

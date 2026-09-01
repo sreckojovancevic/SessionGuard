@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- The Windows 10 SDK flavour of the TFM is what projects the WinRT
+         KeyCredentialManager (Windows Hello) APIs into C#. -->
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>12.0</LangVersion>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Icon of the .exe itself, in Explorer and on the taskbar button. -->
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+    <AssemblyName>SessionGuard</AssemblyName>
+    <RootNamespace>SessionGuard.Windows</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Also embedded as a resource so the WPF window can use it at runtime;
+         ApplicationIcon alone leaves the window with the default WPF icon. -->
+    <Resource Include="Assets\app.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../SessionGuard.Core/SessionGuard.Core.csproj" />
+  </ItemGroup>
+
+</Project>
