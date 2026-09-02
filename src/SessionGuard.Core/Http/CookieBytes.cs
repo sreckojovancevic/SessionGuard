@@ -43,8 +43,16 @@ public static class CookieBytes
     /// Attribute names and Path are not secrets, so they may become strings;
     /// the cookie value never does.
     /// </summary>
+    /// <param name="HttpOnly">
+    /// Set when the server marked the cookie unreadable from script. This decides
+    /// whether the cookie can safely be taken away from the browser at all: an
+    /// HttpOnly cookie is by definition one the page's JavaScript never sees, so
+    /// holding it in the vault cannot break the page. A cookie without the
+    /// attribute may be read — or rewritten — by the site's own script, and
+    /// removing it breaks whatever that script does with it.
+    /// </param>
     public readonly record struct SetCookieAttributes(
-        bool IsDeletion, string? Path, string? Domain);
+        bool IsDeletion, string? Path, string? Domain, bool HttpOnly);
 
     /// <summary>
     /// Reads the attributes after the first name=value pair.
@@ -59,9 +67,10 @@ public static class CookieBytes
         bool deletion = false;
         string? path = null;
         string? domain = null;
+        bool httpOnly = false;
 
         int semi = header.IndexOf((byte)';');
-        if (semi < 0) return new SetCookieAttributes(false, null, null);
+        if (semi < 0) return new SetCookieAttributes(false, null, null, false);
 
         int pos = semi + 1;
         while (pos <= header.Length)
@@ -96,12 +105,17 @@ public static class CookieBytes
                 // Not a secret; the scope decision needs it as text.
                 domain = System.Text.Encoding.ASCII.GetString(val);
             }
+            else if (EqualsAsciiIgnoreCase(key, "httponly"u8))
+            {
+                // A valueless attribute: present or absent, nothing to parse.
+                httpOnly = true;
+            }
 
             if (next < 0) break;
             pos = end + 1;
         }
 
-        return new SetCookieAttributes(deletion, path, domain);
+        return new SetCookieAttributes(deletion, path, domain, httpOnly);
     }
 
     private static ReadOnlySpan<byte> Trim(ReadOnlySpan<byte> s)

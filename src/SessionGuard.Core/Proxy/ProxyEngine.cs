@@ -62,6 +62,7 @@ public sealed class ProxyEngine : IAsyncDisposable
     private readonly CertificateAuthority _ca;
     private readonly ProtectedHostSet _protected;
     private readonly TcpListener _listener;
+    private readonly InterceptionCache _uninterceptable;
     private CancellationTokenSource? _cts;
     private Task? _acceptLoop;
 
@@ -73,10 +74,14 @@ public sealed class ProxyEngine : IAsyncDisposable
         _authorizer = authorizer;
         _ca = ca;
         _protected = new ProtectedHostSet(options.ProtectedHosts);
+        _uninterceptable = new InterceptionCache();
         _listener = new TcpListener(IPAddress.Loopback, options.ListenPort);
     }
 
     public event Action<ProxyEvent>? Observed;
+
+    /// <summary>Protected hosts currently being passed through unprotected.</summary>
+    public InterceptionCache Skipped => _uninterceptable;
     public int ListenPort { get; private set; }
     public bool IsRunning => _acceptLoop is not null;
 
@@ -160,6 +165,15 @@ public sealed class ProxyEngine : IAsyncDisposable
             return;
         }
 
+        if (_uninterceptable.ShouldBypass(host))
+        {
+            // Known not to work — do not spend a failed request rediscovering it.
+            Emit("tunnel_unprotected", host, "previously found uninterceptable");
+            await TunnelAsync(clientStream, host, port, token).ConfigureAwait(false);
+            return;
+        }
+
+        Emit("intercept", host, $"CONNECT {port}");
         await InterceptAsync(clientStream, host, port, clientEndpoint, token)
             .ConfigureAwait(false);
     }
@@ -278,50 +292,103 @@ public sealed class ProxyEngine : IAsyncDisposable
 
     // -------------------------------------------------------- interception
 
+    /// <summary>
+    /// Terminate TLS with the browser and relay HTTP for a protected host.
+    ///
+    /// Upstream is established FIRST, deliberately. Interception and protection
+    /// are the same act: once the browser has completed a TLS handshake against
+    /// our leaf certificate there is no way back to a plain tunnel on that
+    /// connection, so discovering upstream trouble afterwards means a failed
+    /// request the user sees.
+    ///
+    /// Doing upstream first — and reading nothing from the client until it is
+    /// settled — leaves the browser's ClientHello untouched in the socket
+    /// buffer. A host that turns out to refuse HTTP/1.1 can then be relayed
+    /// blind from its very first byte, and the browser never learns that
+    /// anything was reconsidered.
+    /// </summary>
     private async Task InterceptAsync(Stream clientStream, string host, int port,
                                       IPEndPoint clientEndpoint, CancellationToken token)
     {
-        var leaf = _ca.LeafFor(host);
-        var sslClient = new SslStream(clientStream, leaveInnerStreamOpen: false);
-        try
-        {
-            await sslClient.AuthenticateAsServerAsync(
-                leaf, clientCertificateRequired: false,
-                enabledSslProtocols: SslProtocols.Tls12 | SslProtocols.Tls13,
-                checkCertificateRevocation: false).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            Emit("tls_server_failed", host, ex.GetType().Name);
-            await sslClient.DisposeAsync().ConfigureAwait(false);
-            return;
-        }
-
-        using var remote = new TcpClient();
+        var remote = new TcpClient();
         SslStream? sslRemote = null;
         try
         {
-            await remote.ConnectAsync(host, port, token).ConfigureAwait(false);
-            // Upstream validation stays ON. Terminating the browser's TLS and
-            // then trusting any certificate would put a MITM hole exactly where
-            // the session is most exposed.
-            sslRemote = new SslStream(remote.GetStream(), false,
-                _options.UpstreamValidation ??
-                ((_, _, _, errors) => errors == SslPolicyErrors.None));
-            await sslRemote.AuthenticateAsClientAsync(host).ConfigureAwait(false);
+            try
+            {
+                await remote.ConnectAsync(host, port, token).ConfigureAwait(false);
 
-            await PumpHttpAsync(sslClient, sslRemote, host, clientEndpoint, token)
-                .ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            Emit("upstream_failed", host,
-                 $"{ex.GetType().Name}: {Describe(ex)}");
+                // Upstream validation stays ON. Terminating the browser's TLS
+                // and then trusting any certificate would put a MITM hole
+                // exactly where the session is most exposed.
+                sslRemote = new SslStream(remote.GetStream(), false,
+                    _options.UpstreamValidation ??
+                    ((_, _, _, errors) => errors == SslPolicyErrors.None));
+
+                await sslRemote.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                {
+                    TargetHost = host,
+                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                    // This proxy speaks HTTP/1.1 only; say so, and find out now
+                    // rather than after committing to the browser.
+                    ApplicationProtocols = new() { SslApplicationProtocol.Http11 },
+                }, token).ConfigureAwait(false);
+
+                var chosen = sslRemote.NegotiatedApplicationProtocol;
+                Emit("upstream_tls", host,
+                    $"protocol={sslRemote.SslProtocol}; alpn={(chosen == default ? "none" : chosen.ToString())}");
+                if (chosen != default && chosen != SslApplicationProtocol.Http11)
+                    throw new AuthenticationException(
+                        $"upstream selected {chosen}, which this proxy cannot parse");
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Fall back to a blind tunnel. Nothing has been read from the
+                // client yet, so this costs no failed request.
+                string reason = ex is AuthenticationException
+                    ? "requires HTTP/2 or refused our TLS"
+                    : $"{ex.GetType().Name}: {Describe(ex)}";
+                _uninterceptable.Mark(host, reason);
+                Emit("interception_unavailable", host, reason + " — passing through UNPROTECTED");
+
+                if (sslRemote is not null)
+                {
+                    await sslRemote.DisposeAsync().ConfigureAwait(false);
+                    sslRemote = null;
+                }
+                remote.Dispose();
+                remote = new TcpClient();
+
+                await TunnelAsync(clientStream, host, port, token).ConfigureAwait(false);
+                return;
+            }
+
+            var leaf = _ca.LeafFor(host);
+            var sslClient = new SslStream(clientStream, leaveInnerStreamOpen: false);
+            try
+            {
+                await sslClient.AuthenticateAsServerAsync(
+                    leaf, clientCertificateRequired: false,
+                    enabledSslProtocols: SslProtocols.Tls12 | SslProtocols.Tls13,
+                    checkCertificateRevocation: false).ConfigureAwait(false);
+                Emit("client_tls", host, $"protocol={sslClient.SslProtocol}");
+
+                await PumpHttpAsync(sslClient, sslRemote!, host, clientEndpoint, token)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Emit("client_tls_failed", host, $"{ex.GetType().Name}: {Describe(ex)}");
+            }
+            finally
+            {
+                await sslClient.DisposeAsync().ConfigureAwait(false);
+            }
         }
         finally
         {
             if (sslRemote is not null) await sslRemote.DisposeAsync().ConfigureAwait(false);
-            await sslClient.DisposeAsync().ConfigureAwait(false);
+            remote.Dispose();
         }
     }
 
@@ -336,8 +403,12 @@ public sealed class ProxyEngine : IAsyncDisposable
 
             bool isHead = request.MethodIs("HEAD"u8);
             bool authorized = _authorizer.Authorize(clientEndpoint, ListenPort, out string reason);
+            string path = RequestPath(request);
+            string method = RequestMethod(request);
+            Emit("request", host,
+                $"{method} {path}; authorized={authorized}; reason={reason}");
 
-            ApplyOutbound(request, host, RequestPath(request), authorized, reason);
+            ApplyOutbound(request, host, path, authorized, reason);
 
             byte[] reqWire = request.Serialize(out int reqLen);
             try { await WriteAsync(remote, reqWire.AsMemory(0, reqLen), token).ConfigureAwait(false); }
@@ -351,6 +422,8 @@ public sealed class ProxyEngine : IAsyncDisposable
                                                  .ConfigureAwait(false);
             if (response is null) return;
 
+            Emit("response", host,
+                $"{ResponseStatus(response)}; closeDelimited={response.CloseDelimited}");
             ApplyInbound(response, host);
 
             byte[] resWire = response.Serialize(out int resLen);
@@ -387,6 +460,25 @@ public sealed class ProxyEngine : IAsyncDisposable
     /// site's unguarded cookies and dropping any guarded name the client sent,
     /// then attaches the vault's cookies when authorized.
     /// </summary>
+    /// <summary>HTTP method without exposing a request target or body.</summary>
+    private static string RequestMethod(HttpMessage request)
+    {
+        var sl = request.Head.StartLine;
+        int sp = sl.IndexOf((byte)' ');
+        return sp > 0 ? Encoding.ASCII.GetString(sl[..sp]) : "?";
+    }
+
+    /// <summary>HTTP response status line without exposing headers or body.</summary>
+    private static string ResponseStatus(HttpMessage response)
+    {
+        var sl = response.Head.StartLine;
+        string text = Encoding.ASCII.GetString(sl);
+        int first = text.IndexOf(' ');
+        if (first < 0) return text;
+        int second = text.IndexOf(' ', first + 1);
+        return second < 0 ? text[first..] : text[(first + 1)..second];
+    }
+
     /// <summary>Target path of a request, used for cookie Path matching.</summary>
     private static string RequestPath(HttpMessage request)
     {
@@ -411,6 +503,7 @@ public sealed class ProxyEngine : IAsyncDisposable
             var vault = _vault;
             string h = host;
             var dropped = new List<string>();
+            var passed = new List<string>();
 
             CookieBytes.ForEachRequestCookie(value, (name, val) =>
             {
@@ -424,8 +517,11 @@ public sealed class ProxyEngine : IAsyncDisposable
                 pair[name.Length] = (byte)'=';
                 val.CopyTo(pair.AsSpan(name.Length + 1));
                 kept.Add(pair);
+                passed.Add(Encoding.ASCII.GetString(name));
             });
 
+            if (passed.Count > 0)
+                Emit("client_cookies", host, "passed=" + string.Join(",", passed));
             if (dropped.Count > 0)
                 Emit("stripped_client_cookie", host, string.Join(",", dropped));
         }
@@ -485,18 +581,35 @@ public sealed class ProxyEngine : IAsyncDisposable
     }
 
     /// <summary>
-    /// Captures every Set-Cookie into the vault and removes them all.
+    /// Captures Set-Cookie into the vault and removes those it captured.
     ///
     /// A Set-Cookie with Max-Age=0 or a past Expires is the server revoking the
     /// cookie — a sign-out. That must delete the vault entry, not store an empty
     /// value that then gets replayed forever.
+    ///
+    /// <para><b>Script-readable cookies are left to the browser.</b> Taking a
+    /// cookie away from the browser is invisible to the server but not to the
+    /// page: any cookie without <c>HttpOnly</c> may be read, and often rewritten,
+    /// by the site's own JavaScript. Anti-automation tokens are the common case —
+    /// a script reads the token from <c>document.cookie</c>, signs the next
+    /// request with it, and gets an empty string because the vault holds it. The
+    /// server then sees a stream of badly signed requests, which is
+    /// indistinguishable from an attack and answered like one.</para>
+    ///
+    /// <para>Nothing is lost by leaving them. A cookie the page can read is one
+    /// that any script on that page can already exfiltrate, so vaulting it never
+    /// closed the hole it appeared to close — it only broke the site. The
+    /// property this project claims is about credentials the browser holds and
+    /// script cannot touch, and <c>HttpOnly</c> is exactly the server's own
+    /// marking of which ones those are.</para>
     /// </summary>
     private void ApplyInbound(HttpMessage response, string host)
     {
         var head = response.Head;
         var captured = new List<string>();
         var revoked = new List<string>();
-        var passThrough = new List<byte[]>();   // refused scopes, kept verbatim
+        var scriptReadable = new List<string>();
+        var passThrough = new List<byte[]>();   // not vaulted, kept verbatim
 
         // Walk header lines; there may be several Set-Cookie headers.
         for (int i = 1; head.TryGetLine(i, out int ls, out int ll); i++)
@@ -516,6 +629,16 @@ public sealed class ProxyEngine : IAsyncDisposable
 
             var name = value[nr];
             var attrs = CookieBytes.ParseAttributes(value);
+
+            // Already-guarded names stay guarded even if this particular header
+            // omits HttpOnly, so that a sign-out still reaches the vault: a
+            // server is free to send different attributes when deleting.
+            if (!attrs.HttpOnly && !_vault.IsGuarded(host, name))
+            {
+                passThrough.Add(value.ToArray());
+                scriptReadable.Add(Encoding.ASCII.GetString(name));
+                continue;
+            }
 
             if (attrs.IsDeletion)
             {
@@ -540,6 +663,13 @@ public sealed class ProxyEngine : IAsyncDisposable
             }
         }
 
+        if (scriptReadable.Count > 0)
+            Emit("left_to_browser", host, string.Join(",", scriptReadable) + " (no HttpOnly)");
+
+        // Only rewrite the header block if something was actually taken. When
+        // every cookie passes through, the response must leave exactly as it
+        // arrived — reordering headers for no reason is a difference the site
+        // can observe and this proxy has no business creating.
         if (captured.Count > 0)
         {
             head.RemoveAll(SetCookieHeader);

@@ -27,7 +27,9 @@ namespace SessionGuard.Windows;
 ///                              *before* the registry is touched, and reconciled
 ///                              at the next startup.
 ///
-/// Note this is WinINET: Chrome and Edge follow it, Firefox does not by default.
+/// Note this is WinINET. Chrome and Edge follow it, and so does Firefox, whose
+/// default is "use system proxy settings" — Firefox's obstacle here is its
+/// separate certificate store, not the proxy setting.
 /// </summary>
 [SupportedOSPlatform("windows")]
 public sealed class SystemProxySwitch
@@ -55,6 +57,25 @@ public sealed class SystemProxySwitch
     public string MarkerPath => _markerPath;
 
     /// <summary>
+    /// What WinINET currently says, read straight back from the registry.
+    ///
+    /// Worth surfacing rather than assuming: "did the app actually set it?" is
+    /// otherwise unanswerable without opening Internet Options by hand, which
+    /// is exactly the manual step this switch exists to remove.
+    /// </summary>
+    public string ReadBack()
+    {
+        using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RegPath, writable: false);
+        if (key is null) return "Internet Settings key not readable";
+        object? enable = key.GetValue("ProxyEnable");
+        string? server = key.GetValue("ProxyServer") as string;
+        bool on = enable is int i && i != 0;
+        return on
+            ? $"system proxy ON -> {server ?? "(no address)"}"
+            : $"system proxy OFF{(server is null ? "" : $" (address left as {server})")}";
+    }
+
+    /// <summary>
     /// Called at startup. If a marker survived a crash, the user's settings are
     /// restored before anything else happens.
     /// </summary>
@@ -72,24 +93,60 @@ public sealed class SystemProxySwitch
         var saved = ReadCurrent(proxyServer);
         File.WriteAllText(_markerPath, JsonSerializer.Serialize(saved));
 
-        using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RegPath, writable: true);
-        if (key is null) throw new InvalidOperationException("Internet Settings key missing");
+        using (RegistryKey? key = Registry.CurrentUser.OpenSubKey(RegPath, writable: true))
+        {
+            if (key is null)
+                throw new InvalidOperationException(
+                    $"cannot open HKCU\\{RegPath} for writing");
 
-        key.SetValue("ProxyEnable", 1, RegistryValueKind.DWord);
-        key.SetValue("ProxyServer", proxyServer, RegistryValueKind.String);
-        key.SetValue("ProxyOverride",
-            MergeOverride(saved.ProxyOverride), RegistryValueKind.String);
+            key.SetValue("ProxyEnable", 1, RegistryValueKind.DWord);
+            key.SetValue("ProxyServer", proxyServer, RegistryValueKind.String);
+            key.SetValue("ProxyOverride",
+                MergeOverride(saved.ProxyOverride), RegistryValueKind.String);
+        }
         Refresh();
+
+        // Verify rather than assume. A write that goes nowhere — wrong hive,
+        // redirection, a policy overriding the value — otherwise looks exactly
+        // like a working one from inside the application.
+        string after = ReadBack();
+        Applied?.Invoke(after);
+        if (!after.Contains(proxyServer, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                $"wrote the proxy setting but the registry reads back as '{after}'. " +
+                $"This usually means the application is running as a different " +
+                $"Windows account than the browser: it writes to that account's " +
+                $"HKCU, which is not the one Internet Options shows you. " +
+                $"Running as: {Environment.UserDomainName}\\{Environment.UserName}");
     }
 
+    /// <summary>
+    /// Puts back what <see cref="Apply"/> replaced. Does nothing at all if this
+    /// installation never applied anything.
+    ///
+    /// The marker file is the record of ownership, and that is the whole point:
+    /// no marker means these settings are not ours to change. An earlier version
+    /// treated a missing marker as "restore to a safe default" and wrote
+    /// ProxyEnable=0, which meant that merely opening and closing the window
+    /// turned off a proxy the user had configured by hand — a change nothing in
+    /// the UI had offered to make, and one that looked from the outside like the
+    /// application being unable to write the registry at all.
+    ///
+    /// Turning the proxy off when we did not turn it on is <see cref="ForceOff"/>,
+    /// which the user asks for explicitly.
+    /// </summary>
     public void Restore()
     {
-        SavedState? saved = null;
-        if (File.Exists(_markerPath))
+        if (!File.Exists(_markerPath))
         {
-            try { saved = JsonSerializer.Deserialize<SavedState>(File.ReadAllText(_markerPath)); }
-            catch (JsonException) { saved = null; }
+            NothingToRestore?.Invoke(ReadBack());
+            return;
         }
+
+        SavedState? saved;
+        try { saved = JsonSerializer.Deserialize<SavedState>(File.ReadAllText(_markerPath)); }
+        catch (JsonException) { saved = null; }
+        catch (IOException) { saved = null; }
 
         using (RegistryKey? key = Registry.CurrentUser.OpenSubKey(RegPath, writable: true))
         {
@@ -97,8 +154,10 @@ public sealed class SystemProxySwitch
             {
                 if (saved is null)
                 {
-                    // No record of what was there: the safe default is proxy off,
-                    // leaving any address in place rather than deleting it.
+                    // The marker exists but is unreadable, so we did apply
+                    // something and cannot tell what preceded it. Proxy off is
+                    // the only choice that leaves a working network, since the
+                    // address on file points at a port we are about to close.
                     key.SetValue("ProxyEnable", 0, RegistryValueKind.DWord);
                 }
                 else
@@ -111,8 +170,16 @@ public sealed class SystemProxySwitch
         }
 
         Refresh();
-        try { if (File.Exists(_markerPath)) File.Delete(_markerPath); } catch { }
+        try { File.Delete(_markerPath); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        Restored?.Invoke(ReadBack());
     }
+
+    /// <summary>Raised after a change, carrying what the registry now says.</summary>
+    public event Action<string>? Applied;
+    public event Action<string>? Restored;
+
+    /// <summary>Raised when Restore was called but this installation owns nothing.</summary>
+    public event Action<string>? NothingToRestore;
 
     private static void Write(RegistryKey key, string name, object? value,
                               RegistryValueKind kind)

@@ -25,6 +25,12 @@ public sealed class MockService : IAsyncDisposable
     public int Port { get; }
     public string Host { get; }
 
+    /// <summary>
+    /// ALPN protocols this service will accept. Set to h2 only to stand in for
+    /// a host that refuses HTTP/1.1.
+    /// </summary>
+    public List<SslApplicationProtocol>? AlpnProtocols { get; init; }
+
     public MockService(params string[] hosts)
     {
         Host = hosts[0];
@@ -96,9 +102,14 @@ public sealed class MockService : IAsyncDisposable
             var ssl = new SslStream(net, false);
             try
             {
-                await ssl.AuthenticateAsServerAsync(_leaf, false,
-                    System.Security.Authentication.SslProtocols.Tls12 |
-                    System.Security.Authentication.SslProtocols.Tls13, false);
+                await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = _leaf,
+                    EnabledSslProtocols =
+                        System.Security.Authentication.SslProtocols.Tls12 |
+                        System.Security.Authentication.SslProtocols.Tls13,
+                    ApplicationProtocols = AlpnProtocols,
+                });
 
                 while (true)
                 {
@@ -236,7 +247,10 @@ public sealed class MockService : IAsyncDisposable
         {
             return Build(200, "{\"ok\":true}", new[]
             {
-                $"adm={Convert.ToHexString(RandomNumberGenerator.GetBytes(8))}; Path=/admin; Secure",
+                // HttpOnly on purpose: without it the cookie stays with the
+                // browser, and the browser's own path matching would satisfy the
+                // check while testing nothing about the vault's.
+                $"adm={Convert.ToHexString(RandomNumberGenerator.GetBytes(8))}; Path=/admin; HttpOnly; Secure",
             });
         }
 

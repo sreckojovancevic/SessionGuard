@@ -6,27 +6,6 @@ them in a local vault protected by a TPM-backed key. A protected cookie is
 attached to an outbound request only when the local authorization policy allows
 it.
 
-## Why this exists
-
-SessionGuard started from a real incident: a session from my TikTok account was
-stolen and subsequently used by someone else to access the account and run
-their own LIVE.
-
-The problem was not that the password was known. The problem was that the
-session itself had become the credential. Once the session cookie was outside
-the original browser environment, the service had no reason to distinguish the
-attacker from the legitimate session.
-
-That led to a simple question:
-
-> What if the browser never had the protected session credential in the first
-> place?
-
-SessionGuard is an experiment around that question. Instead of allowing the
-browser to persist the protected session cookie as ordinary browser state, the
-cookie is kept in a local vault and supplied only when an authorized request
-needs it.
-
 The design is intentionally local: the service being accessed does not need to
 implement a new session protocol.
 
@@ -60,6 +39,11 @@ For protected hosts, the session cookie is captured from `Set-Cookie` and kept
 in the vault instead of being left in the browser's cookie jar. On an authorized
 request SessionGuard reconstructs the `Cookie` header immediately before the
 request is sent upstream.
+
+**Only `HttpOnly` cookies are captured.** A cookie without that attribute is one
+the page's own JavaScript reads, so taking it breaks the site — and protects
+nothing, since any script that could steal it can already read it from
+`document.cookie`. Cookies left behind are named in the Vault panel.
 
 The current Windows implementation uses:
 
@@ -234,6 +218,8 @@ process rather than from the visible browser process itself.
 - TLS pinning can break interception. Only explicitly configured hosts are
   intercepted.
 - `localStorage` and IndexedDB tokens are outside the proxy's cookie model.
+- Cookies without `HttpOnly` are deliberately not protected. A site that keeps
+  its session in a script-readable cookie cannot be protected by this design.
 - The vault is in-process and is lost when SessionGuard exits.
 - Process lineage is a defence-in-depth mechanism, not a perfect boundary
   against malware already running as the same Windows user.
@@ -269,8 +255,8 @@ so on Windows add these to `C:\Windows\System32\drivers\etc\hosts` first:
 
 Core and the suite build and run on any .NET 8 platform. The Windows project
 needs Windows tooling; five of its files are additionally type-checked against
-`net8.0` in isolation, and `WindowsHello.cs` plus the XAML are only validated
-by building on Windows.
+`net8.0` in isolation, and `WindowsHello.cs` plus the XAML are only validated by
+building on Windows.
 
 ## Security model in one sentence
 
@@ -280,6 +266,9 @@ then supplies it only at request time.**
 
 ## License
 
-APACHE 2.0
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).
 
-Copyright 2026 Srecko Jovancevic
+The Apache-2.0 grant includes an explicit patent licence, which matters here
+because this implementation accompanies protocol work; and, like every licence
+in this family, it disclaims warranties. That disclaimer is not a formality for
+a security prototype — see the limitations above.

@@ -47,6 +47,15 @@ public partial class MainWindow : Window
     private ProxyEngine? _engine;
     private bool _busy;
 
+    /// <summary>host:name pairs the guard chose not to vault, for the UI.</summary>
+    private readonly SortedSet<string> _leftAlone = new(StringComparer.OrdinalIgnoreCase);
+
+    private bool _logging = true;
+    private bool _logDirty;
+    private int _suppressed;
+
+    private readonly System.Collections.Concurrent.ConcurrentQueue<ProxyEvent> _events = new();
+
     public MainWindow()
     {
         InitializeComponent();
@@ -59,6 +68,10 @@ public partial class MainWindow : Window
         _ca = new CertificateAuthority(new DpapiCaStore());
         _authorizer = new PeerAuthorizer(_resolver, _lease);
         _scanner = new BrowserScanner(_resolver);
+        _sysProxy.Applied += now => Dispatcher.BeginInvoke(() => Log("registry now says: " + now));
+        _sysProxy.Restored += now => Dispatcher.BeginInvoke(() => Log("registry now says: " + now));
+        _sysProxy.NothingToRestore += now => Dispatcher.BeginInvoke(() => Log(
+            "left the system proxy alone — this run never changed it (" + now + ")"));
         _sysProxy.LoopbackOriginalIgnored += old => Dispatcher.BeginInvoke(() => Log(
             $"ignored a pre-existing loopback proxy setting ('{old}') — restoring it " +
             "later would have left this machine with no internet"));
@@ -72,7 +85,7 @@ public partial class MainWindow : Window
         SystemEvents.SessionEnding += (_, _) => SafeRestore();
 
         _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-        _timer.Tick += (_, _) => RefreshState();
+        _timer.Tick += (_, _) => { DrainEvents(); RefreshState(); FlushLog(); };
         _timer.Start();
 
         PopulatePresenceModes();
@@ -216,8 +229,16 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// Every step announces itself before it runs. The system proxy is written
+    /// last, so anything that fails earlier — an untrusted root, a port already
+    /// held by another copy — leaves the registry untouched, which from outside
+    /// is indistinguishable from "the application cannot write the proxy
+    /// setting". The line logged before each step is what tells those apart.
+    /// </summary>
     private void TurnOn(SessionVault vault)
     {
+        Log("turn on: checking the root certificate");
         EnsureRootTrusted();
 
         var hosts = _hosts.Load();
@@ -231,18 +252,28 @@ public partial class MainWindow : Window
                 "SessionGuard", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
 
+        Log($"turn on: opening the listener on 127.0.0.1:{ListenPort}");
         var options = new ProxyOptions(ListenPort, hosts);
         var engine = new ProxyEngine(options, vault, _authorizer, _ca);
-        engine.Observed += ev => Dispatcher.BeginInvoke(() => Log(ev.ToString()));
+        // Queue, do not marshal. Events arrive on the proxy's connection threads,
+        // and since tracing became per-request a busy site emits several per
+        // request. One Dispatcher.BeginInvoke each would post thousands of work
+        // items onto the UI thread, which stops responding to the user while it
+        // works through a backlog describing traffic that has already finished.
+        // The queue is drained once per timer tick instead, so the network path
+        // never waits on the interface.
+        engine.Observed += _events.Enqueue;
         engine.Start();
         _engine = engine;
 
+        Log("turn on: writing the system proxy setting");
         _sysProxy.Apply($"127.0.0.1:{ListenPort}");
         Log($"guard on; system proxy -> 127.0.0.1:{ListenPort}");
     }
 
     private async Task TurnOffAsync()
     {
+        Log("turn off: restoring the system proxy setting");
         _sysProxy.Restore();
         if (_engine is not null)
         {
@@ -287,7 +318,7 @@ public partial class MainWindow : Window
         Log($"protected hosts: {(hosts.Count == 0 ? "(none)" : string.Join(", ", hosts))}");
     }
 
-    private void BtnSaveHosts_Click(object sender, RoutedEventArgs e)
+    private async void BtnSaveHosts_Click(object sender, RoutedEventArgs e)
     {
         var entered = (TxtHosts.Text ?? "")
             .Split(new[] { ',', ';', ' ', '\n', '\r', '\t' },
@@ -296,6 +327,43 @@ public partial class MainWindow : Window
         LoadHosts();
         if (_engine is not null)
             Log("host list saved — turn the guard off and on for it to take effect");
+
+        BtnSaveHosts.IsEnabled = false;
+        try { await ProbeHostsAsync(); }
+        finally { BtnSaveHosts.IsEnabled = true; }
+    }
+
+    /// <summary>
+    /// Checks each host as it is added, so a site that cannot be intercepted is
+    /// reported now rather than breaking silently later. A wildcard entry is
+    /// probed at its bare domain — all that can be checked without guessing
+    /// subdomain names, which is exactly why the result is worded as an
+    /// observation and not a promise.
+    /// </summary>
+    private async Task ProbeHostsAsync()
+    {
+        var hosts = _hosts.Load();
+        if (hosts.Count == 0) return;
+
+        Log("checking hosts…");
+        bool anyProblem = false;
+
+        foreach (string entry in hosts)
+        {
+            string host = entry.StartsWith("*.", StringComparison.Ordinal)
+                ? entry[2..]
+                : entry;
+            var result = await HostProbe.RunAsync(host).ConfigureAwait(true);
+            Log("  " + result.Summary);
+            if (!result.CanIntercept) anyProblem = true;
+        }
+
+        Log("  note: " + ProbeResult.Caveat);
+        if (anyProblem)
+            MessageBox.Show(
+                "One or more hosts cannot be intercepted — see the log.\n\n" +
+                "They will still work; they simply pass through unprotected.",
+                "SessionGuard", MessageBoxButton.OK, MessageBoxImage.Warning);
     }
 
     // ----------------------------------------------------------- presence
@@ -505,22 +573,201 @@ public partial class MainWindow : Window
             LeaseText.Foreground = Brush("#F5A524");
         }
 
+        try
+        {
+            string state = _sysProxy.ReadBack();
+            ProxyStateText.Text = state;
+            // Amber when the app is on but Windows does not agree — that is the
+            // case worth noticing, and the one that used to need a trip to
+            // Internet Options to diagnose.
+            bool windowsAgrees = state.Contains($"127.0.0.1:{ListenPort}");
+            ProxyStateText.Foreground = Brush(
+                on == windowsAgrees ? "#8B93A1" : "#F5A524");
+        }
+        catch (Exception ex)
+        {
+            ProxyStateText.Text = "could not read system proxy: " + ex.Message;
+            ProxyStateText.Foreground = Brush("#E5484D");
+        }
+
+        var skipped = _engine?.Skipped.Current ?? Array.Empty<SkippedHost>();
+        SkippedText.Text = skipped.Count == 0
+            ? ""
+            : $"{skipped.Count} host(s) passing through UNPROTECTED: " +
+              string.Join("; ", skipped.Select(x => x.ToString()));
+
         var hosts = _vault?.Hosts ?? Array.Empty<string>();
         VaultText.Text = hosts.Count == 0
             ? "empty"
             : string.Join("\n", hosts.Select(h =>
                 $"{h}: {string.Join(", ", _vault!.Names(h))}"));
+
+        // Naming what was deliberately not taken. These cookies stay in the
+        // browser profile, so they are exactly as stealable as before — and a
+        // user reading a short vault list has no way to tell that from a bug.
+        LeftAloneText.Text = _leftAlone.Count == 0
+            ? ""
+            : "left with the browser (script-readable, not HttpOnly): " +
+              string.Join(", ", _leftAlone.OrderBy(x => x));
     }
 
     private static SolidColorBrush Brush(string hex) =>
         new((Color)ColorConverter.ConvertFromString(hex)!);
 
+    /// <summary>
+    /// Appends a line, unless recording is switched off.
+    ///
+    /// Two separate things are being managed here, and conflating them is what
+    /// made the log unpleasant once per-request tracing arrived.
+    ///
+    /// <para><b>Whether to record at all.</b> The Logging checkbox. Off means
+    /// off — including the lines this application writes about itself, because a
+    /// switch that keeps logging some things is a switch nobody can reason
+    /// about. Suppressed lines are counted and the count is reported when
+    /// recording resumes, so a gap is never mistaken for a quiet period.</para>
+    ///
+    /// <para><b>When to redraw.</b> Not here. Assigning <c>LogText.Text</c>
+    /// copies the whole buffer and forces a re-layout, which on a busy site with
+    /// a line per request is enough to make the window stutter. The buffer is
+    /// appended to immediately and the control is refreshed once per timer tick
+    /// instead — a second of latency on a diagnostic log, in exchange for a UI
+    /// that does not fight the traffic it is describing.</para>
+    /// </summary>
     private void Log(string line)
     {
+        if (!_logging) { _suppressed++; return; }
         _log.AppendLine($"{DateTime.Now:HH:mm:ss}  {line}");
-        if (_log.Length > 16000) _log.Remove(0, 8000);
+        if (_log.Length > 200_000) _log.Remove(0, 100_000);
+        _logDirty = true;
+    }
+
+    /// <summary>
+    /// Drains proxy events on the UI thread. Bounded per tick: if traffic
+    /// outruns the interface the excess is dropped and counted rather than
+    /// allowed to grow without limit, since a log nobody can read is not worth
+    /// the memory it costs.
+    /// </summary>
+    private void DrainEvents()
+    {
+        const int MaxPerTick = 400;
+        int handled = 0;
+        while (handled < MaxPerTick && _events.TryDequeue(out ProxyEvent? ev))
+        {
+            handled++;
+            Log(ev.ToString());
+
+            // Independent of the Logging checkbox: this drives the Vault panel,
+            // which states what is deliberately left unprotected. Turning off
+            // the log must not turn off a security-relevant readout.
+            if (ev.Kind == "left_to_browser" && ev.Host is not null && ev.Detail is not null)
+                foreach (var n in ev.Detail.Split(' ')[0]
+                                    .Split(',', StringSplitOptions.RemoveEmptyEntries))
+                    _leftAlone.Add($"{ev.Host}:{n}");
+        }
+
+        if (handled == MaxPerTick && _events.Count > 5000)
+        {
+            _events.Clear();
+            bool was = _logging;
+            _logging = true;
+            Log("log backlog discarded — events are arriving faster than they can be shown");
+            _logging = was;
+        }
+    }
+
+    /// <summary>Called from the timer: one redraw per tick, and only if needed.</summary>
+    private void FlushLog()
+    {
+        if (!_logDirty) return;
+        _logDirty = false;
+
+        // Autoscroll only if the view is already at the bottom. Yanking the
+        // scrollbar away from someone reading an earlier line is the reason
+        // logs get saved to a file and read in Notepad instead.
+        bool atEnd = LogScroll.ScrollableHeight - LogScroll.VerticalOffset < 24;
         LogText.Text = _log.ToString();
-        LogScroll.ScrollToEnd();
+        if (atEnd) LogScroll.ScrollToEnd();
+    }
+
+    private void ChkLogging_Changed(object sender, RoutedEventArgs e)
+    {
+        _logging = ChkLogging.IsChecked == true;
+        if (_logging)
+        {
+            int missed = _suppressed;
+            _suppressed = 0;
+            Log(missed == 0
+                ? "logging resumed"
+                : $"logging resumed — {missed} line(s) were not recorded while it was off");
+        }
+        else
+        {
+            _logging = true;                    // so this one line gets through
+            Log("logging off — the guard keeps running, nothing else changes");
+            _logging = false;
+            FlushLog();
+        }
+    }
+
+    private void BtnClearLog_Click(object sender, RoutedEventArgs e)
+    {
+        _log.Clear();
+        _suppressed = 0;
+        // Never leave the log without context. A cleared log that then records
+        // only `tunnel host` lines cannot be read afterwards: whether the guard
+        // was even on, which port it was listening on, and which hosts were
+        // supposed to be protected are exactly the questions the missing lines
+        // would have answered.
+        WriteHeader("log cleared");
+        _logDirty = true;
+        FlushLog();
+    }
+
+    /// <summary>
+    /// The state of everything a log line could be misread without. Metadata
+    /// only — host names and cookie names, never a cookie value.
+    /// </summary>
+    private void WriteHeader(string why)
+    {
+        bool was = _logging;
+        _logging = true;                        // a header is worth an exception
+        Log($"--- {why} ---");
+        Log($"  guard: {(_engine?.IsRunning == true ? $"on, listening on 127.0.0.1:{_engine.ListenPort}" : "off")}");
+        try { Log($"  windows: {_sysProxy.ReadBack()}"); } catch { }
+        var hosts = _hosts.Load();
+        Log($"  protected hosts: {(hosts.Count == 0 ? "(none)" : string.Join(", ", hosts))}");
+        Log($"  presence: {PresenceSettings.Describe(_settings.Mode)}; " +
+            $"lease: {(_lease.IsActive ? $"open for pid {_lease.PinnedPid}, {_lease.Remaining.TotalMinutes:F0} min left" : "locked")}");
+        var scopes = _vault?.Hosts ?? Array.Empty<string>();
+        Log($"  vault: {(scopes.Count == 0 ? "empty" : string.Join("; ", scopes.Select(h => $"{h}=[{string.Join(",", _vault!.Names(h))}]")))}");
+        if (_leftAlone.Count > 0)
+            Log($"  left to browser: {string.Join(", ", _leftAlone)}");
+        Log($"  running as: {Environment.UserDomainName}\\{Environment.UserName}");
+        _logging = was;
+    }
+
+    private void BtnSaveLog_Click(object sender, RoutedEventArgs e)
+    {
+        // Anything still queued belongs in the file the user is about to read.
+        DrainEvents();
+        WriteHeader("state at save");
+        FlushLog();
+        try
+        {
+            string path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "SessionGuard",
+                $"log-{DateTime.Now:yyyyMMdd-HHmmss}.txt");
+            File.WriteAllText(path, _log.ToString());
+            Log("log saved to " + path);
+            MessageBox.Show("Saved to:\n\n" + path, "SessionGuard");
+        }
+        catch (Exception ex)
+        {
+            Log("could not save log: " + ex.Message);
+            MessageBox.Show(ex.Message, "SessionGuard",
+                            MessageBoxButton.OK, MessageBoxImage.Error);
+        }
     }
 
     private void SafeRestore()

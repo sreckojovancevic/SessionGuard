@@ -1,2 +1,30 @@
+# Build output
 bin/
 obj/
+publish/
+artifacts/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+
+# NuGet
+*.nupkg
+packages/
+
+# Saved diagnostic logs. These record host names, request paths and cookie
+# names from real browsing — local diagnostic data, not source.
+log-*.txt
+
+# Local state, if it is ever produced inside the tree rather than in
+# %LOCALAPPDATA%\SessionGuard
+proxy-state.json
+settings.json
+protected-hosts.txt
+
+# OS
+Thumbs.db
+.DS_Store

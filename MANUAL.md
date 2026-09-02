@@ -174,6 +174,40 @@ The stored file is:
 If you change the host list while the Guard is already on, turn the Guard off
 and on again. The UI reports this explicitly.
 
+### What Save checks
+
+Pressing **Save** probes each host with a single TLS connection offering only
+HTTP/1.1, and reports what it found:
+
+```text
+tiktok.com — HTTP/1.1 accepted
+some.host — requires HTTP/2, cannot be protected yet
+```
+
+A wildcard entry is probed at its bare domain, which is all that can be checked
+without guessing subdomain names. The result is therefore an observation, not a
+promise: it says nothing about subdomains reached later, about certificate
+pinning (enforced by the client, so a handshake reveals nothing about it), or
+about a site that keeps its session in `localStorage` rather than in cookies.
+
+### Hosts that cannot be intercepted
+
+A subdomain discovered while browsing may refuse HTTP/1.1 even though the bare
+domain accepted it. SessionGuard establishes the upstream connection *before*
+completing the TLS handshake with the browser, so when that happens it can fall
+back to a plain tunnel from the first byte — the request succeeds and nothing
+visibly fails.
+
+Such a host is then remembered for an hour and passed straight through, and the
+UI says so:
+
+```text
+1 host(s) passing through UNPROTECTED: webcast.example.com — requires HTTP/2
+```
+
+That line is deliberate. The traffic works, but it is not protected, and a
+silent skip would be a silent hole.
+
 ---
 
 ## 5. Turn the Guard on
@@ -412,6 +446,47 @@ The exact cookie names depend on the site.
 
 SessionGuard models the important cookie scope rules needed for this design.
 
+### Which cookies are taken at all: `HttpOnly`
+
+**SessionGuard vaults a cookie only if the server marked it `HttpOnly`.**
+Everything else is passed to the browser exactly as the server sent it, and the
+Vault panel names what was left behind:
+
+```text
+left with the browser (script-readable, not HttpOnly): tiktok.com:msToken
+```
+
+`HttpOnly` is the server's own statement that the page's JavaScript never reads
+this cookie — which is precisely the condition under which removing it from the
+browser is invisible to the site. Without the attribute, the site's own script
+may read the cookie, and frequently rewrites it.
+
+The failure this prevents does not look like a cookie problem from the outside.
+Large sites carry anti-automation tokens in ordinary script-readable cookies: a
+script reads the token from `document.cookie`, signs the next request with it,
+and sends the signature along. If the token is in the vault the script reads an
+empty string, signs with nothing, and every request from that page is malformed
+in the same way. To the server that is not a broken proxy — it is a bot, and
+the answer is a rate limit:
+
+```text
+Maximum number of attempts reached. Try again later.
+```
+
+Nothing real is given up by leaving those cookies alone. **A cookie the page can
+read is one that any script on that page can already steal**, so vaulting it
+never closed the hole it appeared to close. What it did was break the site.
+
+The claim therefore narrows, honestly: SessionGuard protects credentials the
+browser holds and script cannot touch. A site that keeps its session in a
+script-readable cookie cannot be protected this way — and could not have been,
+by anything that leaves the page working.
+
+One exception keeps sign-out correct: once a name has been vaulted it stays
+guarded even if a later `Set-Cookie` for it omits `HttpOnly`. Otherwise a
+server's deletion header would pass by and leave a dead credential in the vault
+forever.
+
 ### Domain
 
 A cookie with:
@@ -578,6 +653,62 @@ If necessary, use Task Manager -> Details and type the browser PID directly.
 The scan text and log now report the number of browser processes and roots and
 list PID/PPID information for diagnosis.
 
+### Traffic diagnostics
+
+The main window log is also the safe traffic diagnostic log. It records connection
+mode, TLS negotiation, HTTP method/path, response status, authorization result,
+and cookie **names/actions**. It deliberately does not record cookie values,
+request bodies, authorization headers, or query strings.
+
+Examples:
+
+```text
+intercept              www.tiktok.com    CONNECT 443
+upstream_tls           www.tiktok.com    protocol=Tls13; alpn=http/1.1
+client_tls             www.tiktok.com    protocol=Tls13
+request                www.tiktok.com    GET /; authorized=True; reason=authorized (pinned process)
+client_cookies         www.tiktok.com    passed=msToken,ttwid
+stripped_client_cookie www.tiktok.com    sessionid
+response               www.tiktok.com    200; closeDelimited=False
+left_to_browser        www.tiktok.com    msToken (no HttpOnly)
+vaulted                www.tiktok.com    sessionid
+```
+
+For an authentication problem, compare two runs: first with only the exact host(s)
+protected, then with a wildcard such as `*.example.com`. Save each log with
+**Save log**. The useful difference is which additional subdomains became
+`intercept`, what HTTP status they returned, and which cookie names were vaulted,
+left to the browser, stripped, or injected.
+
+The log is intentionally metadata-only. If a site returns a sensitive value in a
+URL path rather than a query string, treat the saved log as sensitive diagnostic
+data and delete it after analysis.
+
+### Turning recording off
+
+The **Logging** checkbox above the log stops recording. **Clear** empties what
+has been recorded so far.
+
+This affects the log and nothing else. The Guard keeps intercepting, the vault
+keeps working, and the Vault panel keeps naming the cookies left with the
+browser — a security readout must not disappear because a diagnostic was
+switched off.
+
+Off means off, including SessionGuard's own lines about itself. Lines that
+occur while recording is off are counted, and the count is shown on resume:
+
+```text
+logging resumed — 4192 line(s) were not recorded while it was off
+```
+
+so a gap in the log is never mistaken for a quiet period.
+
+Two reasons to switch it off. Per-request tracing on a busy site produces a
+line several times per request, which makes a long session's log hard to read
+and the window's redrawing noticeable. And a saved log is diagnostic data about
+your browsing: leaving recording off when you are not diagnosing anything means
+there is nothing to leave behind.
+
 ### Guard is on but the protected site does not work
 
 Check:
@@ -589,6 +720,34 @@ Check:
 5. The site does not use certificate pinning.
 6. The site stores its authentication token in cookies rather than
    `localStorage`/IndexedDB.
+
+### Sign-in fails with "Maximum number of attempts reached"
+
+Do not assume this means that the password or MFA code was wrong. First compare
+the same flow with SessionGuard off, then with only the exact site host(s)
+protected, and finally with a wildcard if the wildcard is what caused the
+problem.
+
+The traffic log is useful here. Look for:
+
+```text
+intercept              <host>
+request                <host>
+response               <host>
+left_to_browser        <host>
+stripped_client_cookie <host>
+injected               <host>
+vaulted                <host>
+```
+
+If the exact hosts work but `*.domain.example` fails, the first question is which
+additional subdomain became intercepted and returned a different response. Do not
+move every cookie into the vault to solve this: script-readable cookies are
+intentionally left to the browser.
+
+Note also that the site's rate limit may remain active after the technical cause
+has been fixed. Wait for the site's cooldown before repeating the authentication
+flow.
 
 ### `Could not verify your presence`
 

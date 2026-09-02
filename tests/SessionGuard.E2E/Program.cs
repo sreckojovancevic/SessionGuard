@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Security;
+using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using SessionGuard.Core.Authz;
@@ -17,6 +18,7 @@ public static class Program
     private const string OpenHost = "other.example.test";
     private const string WildLogin = "login.sg.test";
     private const string WildApi = "api2.sg.test";
+    private const string H2Only = "h2only.sg.test";
 
     private static readonly List<(string name, bool ok, string detail)> Results = new();
 
@@ -41,6 +43,15 @@ public static class Program
         await using var wildService = new MockService(WildLogin, WildApi);
         wildService.Start();
 
+        // Stands in for a host that will not speak HTTP/1.1. It advertises h2
+        // in ALPN and nothing else, which is what makes the proxy's own
+        // http/1.1-only handshake fail.
+        await using var h2Service = new MockService(H2Only)
+        {
+            AlpnProtocols = new() { SslApplicationProtocol.Http2 },
+        };
+        h2Service.Start();
+
         var sealer = new EphemeralSealer();
         var vault = new SessionVault(sealer);
         var lease = new PresenceLease();
@@ -51,7 +62,8 @@ public static class Program
         // callback proves it is doing real chain work rather than returning true.
         var pinned = new X509Certificate2Collection { service.RootCertificate,
                                                       openService.RootCertificate,
-                                                      wildService.RootCertificate };
+                                                      wildService.RootCertificate,
+                                                      h2Service.RootCertificate };
         RemoteCertificateValidationCallback upstream = (_, cert, _, _) =>
         {
             if (cert is null) return false;
@@ -91,10 +103,22 @@ public static class Program
         Check("browser jar holds no session cookie",
               jarCookies.All(c => c.Name != "sessionid"),
               $"jar=[{string.Join(",", jarCookies.Select(c => c.Name))}]");
-        Check("all Set-Cookie values captured into the vault",
-              vault.Count(ProtectedHost) == 2,
+        Check("the HttpOnly session cookie is captured into the vault",
+              vault.Names(ProtectedHost).Contains("sessionid"),
               $"{vault.Count(ProtectedHost)} cookie(s): " +
               string.Join(",", vault.Names(ProtectedHost)));
+
+        // The other half of the same rule. A cookie without HttpOnly is one the
+        // page's own script reads; taking it away breaks the page and protects
+        // nothing, since any script that could steal it can already read it from
+        // document.cookie. Anti-automation tokens made this concrete: the script
+        // signs the next request with the token, gets an empty string, and the
+        // server answers the resulting garbage the way it answers an attack.
+        Check("a script-readable cookie is left with the browser",
+              !vault.Names(ProtectedHost).Contains("csrf") &&
+              jarCookies.Any(c => c.Name == "csrf"),
+              $"vault=[{string.Join(",", vault.Names(ProtectedHost))}] " +
+              $"jar=[{string.Join(",", jarCookies.Select(c => c.Name))}]");
 
         // 2 --------------------------------------------- authorized use
         Section("2. Authorized use, keep-alive, framing");
@@ -244,6 +268,36 @@ public static class Program
               bad.Headers.TryGetValues("Set-Cookie", out var sc2)
                   ? string.Join(" | ", sc2) : "(no Set-Cookie header)");
 
+        // 5e ------------------------------------------ HTTP/2-only host
+        Section("5e. A protected host that refuses HTTP/1.1");
+
+        var probeGood = await HostProbe.RunAsync(WildLogin, wildService.Port, upstream);
+        Check("probe reports HTTP/1.1 on a normal host",
+              probeGood.Http11Accepted && probeGood.CanIntercept, probeGood.Summary);
+
+        var probeBad = await HostProbe.RunAsync(H2Only, h2Service.Port, upstream);
+        Check("probe detects a host that requires HTTP/2",
+              !probeBad.Http11Accepted && !probeBad.CanIntercept, probeBad.Summary);
+
+        // The browser's view: the request must simply work, with no failed
+        // attempt, and the certificate it sees must be the origin's — proof
+        // that the proxy stepped aside rather than intercepting.
+        var (tunnelStatus, issuer) = await RawRequestAsync(
+            proxy.ListenPort, H2Only, h2Service.Port, "/login", h2Service.RootCertificate);
+        Check("the request still succeeds, with no failed attempt",
+              tunnelStatus == 200, $"HTTP {tunnelStatus}");
+        Check("the client sees the origin certificate, not SessionGuard's",
+              issuer.Contains("Mock Service Root"), issuer);
+        Check("the host is recorded as skipped, not silently dropped",
+              proxy.Skipped.Current.Any(x => x.Host == H2Only),
+              string.Join("; ", proxy.Skipped.Current.Select(x => x.ToString())));
+        // Count(host) would include the earlier .sg.test-scoped cookie, which
+        // legitimately covers this subdomain. What must be true is that nothing
+        // was captured *from* this host: no host-only scope for it exists.
+        Check("no cookie was captured from the skipped host",
+              !vault.Scopes.Contains(H2Only, StringComparer.OrdinalIgnoreCase),
+              $"scopes=[{string.Join(",", vault.Scopes)}]");
+
         // 6 ------------------------------------------------ sealed at rest
         Section("6. Vault contents are sealed");
         byte[] probe = Encoding.ASCII.GetBytes("SUPER-SECRET-SESSION-VALUE");
@@ -324,6 +378,69 @@ public static class Program
               !DomainRules.MayScopeTo("www.tiktok.com", "example.com", out _));
         Check("and not to a bare top-level label",
               !DomainRules.MayScopeTo("www.tiktok.com", "com", out _));
+    }
+
+    /// <summary>
+    /// A deliberately raw client: CONNECT, then TLS straight through, then a
+    /// hand-written HTTP/1.1 request. Used where HttpClient would get in the
+    /// way — here, to speak 1.1 over a connection whose ALPN says h2, which is
+    /// only possible because the proxy is relaying bytes rather than parsing.
+    /// Returns the status code and the issuer of the certificate the client saw.
+    /// </summary>
+    private static async Task<(int status, string issuer)> RawRequestAsync(
+        int proxyPort, string host, int port, string path, X509Certificate2 trustRoot)
+    {
+        using var tcp = new TcpClient();
+        await tcp.ConnectAsync("127.0.0.1", proxyPort);
+        var net = tcp.GetStream();
+
+        var connect = Encoding.ASCII.GetBytes(
+            $"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n");
+        await net.WriteAsync(connect);
+
+        var buf = new byte[4096];
+        int n = await net.ReadAsync(buf);
+        string established = Encoding.ASCII.GetString(buf, 0, n);
+        if (!established.StartsWith("HTTP/1.1 200")) return (-1, established.Trim());
+
+        string issuer = "";
+        var ssl = new SslStream(net, false, (_, cert, _, _) =>
+        {
+            if (cert is not null) issuer = cert.Issuer;
+            var chain = new X509Chain();
+            chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+            chain.ChainPolicy.CustomTrustStore.Add(trustRoot);
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            return cert is not null && chain.Build(new X509Certificate2(cert));
+        });
+        try
+        {
+            await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+            {
+                TargetHost = host,
+                // Offer what the origin insists on, then speak 1.1 anyway: the
+                // origin here is a test double and the point is the relay.
+                ApplicationProtocols = new() { SslApplicationProtocol.Http2 },
+            });
+
+            var req = Encoding.ASCII.GetBytes(
+                $"POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\n" +
+                "Connection: close\r\n\r\n");
+            await ssl.WriteAsync(req);
+
+            int r = await ssl.ReadAsync(buf);
+            string reply = Encoding.ASCII.GetString(buf, 0, r);
+            var parts = reply.Split(' ');
+            return (parts.Length > 1 && int.TryParse(parts[1], out int code) ? code : -1, issuer);
+        }
+        catch (Exception ex)
+        {
+            return (-1, $"{ex.GetType().Name}: {issuer}");
+        }
+        finally
+        {
+            await ssl.DisposeAsync();
+        }
     }
 
     // ------------------------------------------------------------- helpers
@@ -458,7 +575,7 @@ public static class Program
         const string path = "/etc/hosts";
         if (!File.Exists(path)) return;
         string text = File.ReadAllText(path);
-        var missing = new[] { ProtectedHost, OpenHost, WildLogin, WildApi }
+        var missing = new[] { ProtectedHost, OpenHost, WildLogin, WildApi, H2Only }
             .Where(h => !text.Contains(h)).ToArray();
         if (missing.Length == 0) return;
         try
