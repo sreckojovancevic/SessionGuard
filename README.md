@@ -6,14 +6,35 @@ them in a local vault protected by a TPM-backed key. A protected cookie is
 attached to an outbound request only when the local authorization policy allows
 it.
 
+## Why this exists
+
+SessionGuard started from a real incident: a session from my TikTok account was
+stolen and subsequently used by someone else to access the account and run
+their own LIVE.
+
+The problem was not that the password was known. The problem was that the
+session itself had become the credential. Once the session cookie was outside
+the original browser environment, the service had no reason to distinguish the
+attacker from the legitimate session.
+
+That led to a simple question:
+
+> What if the browser never had the protected session credential in the first
+> place?
+
+SessionGuard is an experiment around that question. Instead of allowing the
+browser to persist the protected session cookie as ordinary browser state, the
+cookie is kept in a local vault and supplied only when an authorized request
+needs it.
+
 The design is intentionally local: the service being accessed does not need to
 implement a new session protocol.
 
 > **Status: experimental prototype.** The proxy path, HTTP/1.1 handling,
-cookie/vault logic, process authorization and Windows TPM path are implemented
-and tested. Windows Hello presence is an optional policy, but its current
-implementation is still under development. Do not treat this project as a
-formally audited security product.
+> cookie/vault logic, process authorization and Windows TPM path are implemented
+> and tested. Windows Hello presence is an optional policy, but its current
+> implementation is still under development. Do not treat this project as a
+> formally audited security product.
 
 ## What it does
 

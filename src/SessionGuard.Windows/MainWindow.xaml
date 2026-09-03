@@ -88,6 +88,7 @@
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="Check" Style="{StaticResource Label}"
                                VerticalAlignment="Center" Margin="0,0,10,0"/>
@@ -95,7 +96,11 @@
                               VerticalContentAlignment="Center"
                               Background="#2A2E37" Foreground="#111111"
                               SelectionChanged="CmbPresenceMode_Changed"/>
-                    <Button x:Name="BtnResetKey" Grid.Column="2" Content="Reset key"
+                    <Button x:Name="BtnExportCa" Grid.Column="2" Content="Export CA"
+                            Width="80" Height="28" Margin="8,0,0,0"
+                            Background="#3A3F4B" Click="BtnExportCa_Click"
+                            ToolTip="Save the root certificate to the Desktop, for browsers with their own certificate store"/>
+                    <Button x:Name="BtnResetKey" Grid.Column="3" Content="Reset key"
                             Width="80" Height="28" Margin="8,0,0,0"
                             Background="#8B2C32" Click="BtnResetKey_Click"/>
                 </Grid>

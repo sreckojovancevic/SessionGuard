@@ -226,6 +226,17 @@ public sealed class SystemProxySwitch
             string p = part.Trim();
             int eq = p.IndexOf('=');           // "http=host:port" form
             if (eq >= 0) p = p[(eq + 1)..];
+
+            // A scheme prefix has to come off before the address is examined.
+            // WinINET expects a bare "host:port", but Internet Options accepts
+            // "http://127.0.0.1:28080" typed by hand and stores it verbatim.
+            // Missing that made this check answer "not loopback" for the most
+            // common hand-entered value there is — so the address was recorded
+            // as the user's own setting and dutifully restored, switching the
+            // proxy back off with the guard still running.
+            int scheme = p.IndexOf("://", StringComparison.Ordinal);
+            if (scheme >= 0) p = p[(scheme + 3)..];
+
             if (p.StartsWith("127.", StringComparison.Ordinal) ||
                 p.StartsWith("localhost", StringComparison.OrdinalIgnoreCase) ||
                 p.StartsWith("[::1]", StringComparison.Ordinal) ||

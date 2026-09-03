@@ -30,11 +30,28 @@ public sealed class BrowserScanner
 
     public BrowserScanner(IPeerResolver resolver) => _resolver = resolver;
 
-    public sealed record Candidate(int Pid, string Name, int ParentPid, bool HasWindow)
+    /// <param name="Owner">
+    /// The Windows account the process runs as, or null when it could not be
+    /// read. Decisive when nothing reaches the proxy: the system proxy setting
+    /// lives in HKCU and is therefore per-account, so a browser owned by a
+    /// different account cannot see the one SessionGuard wrote, however
+    /// correctly it was written.
+    /// </param>
+    public sealed record Candidate(int Pid, string Name, int ParentPid, bool HasWindow,
+                                   string? Owner = null)
     {
         public bool IsRoot { get; init; }
+
+        /// <summary>True when this browser runs as some other Windows account.</summary>
+        public bool ForeignOwner =>
+            Owner is not null &&
+            !string.Equals(Owner,
+                $"{Environment.UserDomainName}\\{Environment.UserName}",
+                StringComparison.OrdinalIgnoreCase);
+
         public override string ToString() =>
-            $"{Name} (pid {Pid}){(HasWindow ? "" : " — no window")}";
+            $"{Name} (pid {Pid}){(HasWindow ? "" : " — no window")}" +
+            (ForeignOwner ? $" — runs as {Owner}" : "");
     }
 
     public sealed record ScanResult(
@@ -64,7 +81,14 @@ public sealed class BrowserScanner
                 bool window = false;
                 try { window = p.MainWindowHandle != IntPtr.Zero; } catch { }
 
-                all.Add(new Candidate(p.Id, name, ppid, window));
+                // Owner lookup is best-effort by design: another account's
+                // process, or a protected one, simply refuses to open. That
+                // refusal is itself informative and must not be mistaken for
+                // the scan failing.
+                string? owner = null;
+                try { owner = ProcessOwner.Of(p.Id); } catch { }
+
+                all.Add(new Candidate(p.Id, name, ppid, window, owner));
             }
             catch (Exception ex)
             {
@@ -96,8 +120,26 @@ public sealed class BrowserScanner
               "or type its pid directly."
             : $"{all.Count} browser process(es), {roots.Count} root(s)" +
               (errors.Count > 0 ? $"; {errors.Count} could not be inspected: " +
-                                  string.Join(", ", errors.Take(3)) : "");
+                                  string.Join(", ", errors.Take(3)) : "") +
+              Mismatch(roots);
 
         return new ScanResult(roots, all, diagnosis);
+    }
+
+    /// <summary>
+    /// Says so, loudly, when a browser belongs to another account. This is not
+    /// a warning about the lease — lineage authorization would still work — but
+    /// about the system proxy, which such a browser cannot see at all.
+    /// </summary>
+    private static string Mismatch(IReadOnlyList<Candidate> roots)
+    {
+        var foreign = roots.Where(c => c.ForeignOwner)
+                           .Select(c => $"{c.Name}/{c.Pid} as {c.Owner}")
+                           .ToList();
+        if (foreign.Count == 0) return "";
+        return $"\n  WARNING: {string.Join("; ", foreign)} — SessionGuard runs as " +
+               $"{Environment.UserDomainName}\\{Environment.UserName}. The system proxy " +
+               "setting is per-account, so that browser cannot see it and its traffic " +
+               "will never reach the guard.";
     }
 }

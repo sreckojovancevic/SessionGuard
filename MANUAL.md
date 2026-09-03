@@ -212,6 +212,17 @@ silent skip would be a silent hole.
 
 ## 5. Turn the Guard on
 
+> **Start the browser after this, not before.** Browsers read the Windows proxy
+> setting when they start, and some never notice a later change — Firefox caches
+> it, and a Firefox that believes there is no proxy also enables HTTP/3, so its
+> traffic leaves over UDP and cannot reach the guard at all. A browser that was
+> already running may therefore bypass SessionGuard completely while everything
+> in the application reports success. Since version 19 the Unlock button says so
+> when the browser you picked is older than the guard.
+>
+> The whole working order is: **Turn on → start the browser → Refresh → Unlock →
+> then sign in.**
+
 Press **Turn on**.
 
 The sequence is:
@@ -391,6 +402,26 @@ malware that simply waits for you to unlock, rides on the open lease.
 
 ## 8. Unlocking a browser
 
+> **A locked lease is not a safe idle state — it signs you out.** With the guard
+> on and the lease shut, guarded cookies are taken out of the browser and never
+> put back, so every request to a protected site goes out without its session.
+> The site answers the way it answers a stranger: 401, 403, a login page, or an
+> anti-automation message such as *"Maximum number of attempts reached"*, which
+> looks nothing like a proxy problem.
+>
+> Nothing is broken when this happens; it is the design behaving as written. But
+> it is invisible from the browser, so the lease panel now counts it:
+>
+> ```text
+> LOCKED — 201 request(s) sent without their session.
+> Protected sites will act signed-out until you press Unlock.
+> ```
+>
+> **Sign in only after the lease is open.** Signing in while it is shut sends the
+> whole login flow out unauthenticated; the session cookies are captured into
+> the vault and then never returned, and the site sees an endless series of
+> half-authenticated attempts.
+
 After selecting the browser and the desired presence policy, press **Unlock**.
 
 A successful unlock opens the lease for the configured duration (15 minutes by
@@ -534,16 +565,38 @@ something must not mean destroying it.
 Firefox can use the system proxy, but it maintains its own certificate trust
 store.
 
-If a protected HTTPS site reports a certificate error in Firefox, use one of
-the following approaches:
+These are two independent walls, and they fail in an order that hides the
+second one. Traffic has to reach the guard before a certificate can be
+presented at all — so while the proxy is not being used, everything looks like
+a proxy problem, and the certificate problem only appears once that is fixed.
 
-1. Enable Firefox's enterprise-root integration, or
-2. Import the SessionGuard root certificate into Firefox's trusted authorities.
+If a protected HTTPS site reports a certificate error in Firefox, either:
 
-SessionGuard logs a reminder when Firefox is selected.
+**1. Let Firefox read the Windows store.** In `about:config`:
 
-The Windows root CA installation performed by SessionGuard is therefore not
-necessarily enough for Firefox's certificate validation.
+```text
+security.enterprise_roots.enabled = true
+```
+
+Nothing to import; Firefox then sees the root SessionGuard already installed.
+
+**2. Import the certificate by hand.** Press **Export CA** in SessionGuard — it
+writes `SessionGuard-root-CA.cer` to the Desktop — then in Firefox:
+
+```text
+Settings -> Privacy & Security -> Certificates -> View Certificates
+  -> Authorities -> Import -> select the file
+  -> tick "Trust this CA to identify websites"
+```
+
+Only the public certificate is exported. The private key stays under DPAPI and
+never leaves the machine.
+
+Restart Firefox afterwards — and start it **after** the guard is on, or it may
+not pick up the proxy setting at all (see section 5).
+
+SessionGuard logs a reminder when Firefox is selected, and the Windows root CA
+installation it performs is not by itself enough for Firefox.
 
 ---
 

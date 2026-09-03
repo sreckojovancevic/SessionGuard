@@ -10,7 +10,15 @@ public partial class App : Application
     // state and each restore it on exit, so the second one's shutdown silently
     // undoes the first one's Turn on — the setting reverts with nothing in
     // either log to explain it.
-    private const string InstanceName = @"Local\SessionGuard.SingleInstance.v1";
+    //
+    // The name is Global, not Local. Local is scoped to a single Windows
+    // terminal session, so a copy left running on the console is invisible to a
+    // copy started over Remote Desktop, and the two then contend for one
+    // registry key — precisely the situation this exists to prevent. It is
+    // scoped to the user instead, since the settings being contended are
+    // per-user and two different accounts are not in each other's way.
+    private static readonly string InstanceName =
+        @"Global\SessionGuard.SingleInstance.v2." + Environment.UserName;
     private Mutex? _instance;
 
     protected override void OnStartup(StartupEventArgs e)

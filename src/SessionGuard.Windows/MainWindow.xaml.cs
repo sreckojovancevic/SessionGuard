@@ -56,6 +56,10 @@ public partial class MainWindow : Window
 
     private readonly System.Collections.Concurrent.ConcurrentQueue<ProxyEvent> _events = new();
 
+    private int _connections;
+    private int _denied;
+    private DateTime _guardOnAt = DateTime.MaxValue;
+
     public MainWindow()
     {
         InitializeComponent();
@@ -265,6 +269,9 @@ public partial class MainWindow : Window
         engine.Observed += _events.Enqueue;
         engine.Start();
         _engine = engine;
+        _connections = 0;
+        _denied = 0;
+        _guardOnAt = DateTime.Now;
 
         Log("turn on: writing the system proxy setting");
         _sysProxy.Apply($"127.0.0.1:{ListenPort}");
@@ -274,6 +281,7 @@ public partial class MainWindow : Window
     private async Task TurnOffAsync()
     {
         Log("turn off: restoring the system proxy setting");
+        _guardOnAt = DateTime.MaxValue;
         _sysProxy.Restore();
         if (_engine is not null)
         {
@@ -437,7 +445,8 @@ public partial class MainWindow : Window
         ScanText.Text = result.Diagnosis;
         Log("browser scan: " + result.Diagnosis);
         foreach (var c in result.All)
-            Log($"  {c.Name} pid={c.Pid} ppid={c.ParentPid} window={c.HasWindow}");
+            Log($"  {c.Name} pid={c.Pid} ppid={c.ParentPid} window={c.HasWindow} " +
+                $"owner={c.Owner ?? "(unreadable)"}{(c.ForeignOwner ? "  <-- different account" : "")}");
     }
 
     /// <summary>
@@ -520,6 +529,8 @@ public partial class MainWindow : Window
                     "show a certificate error");
             }
 
+            WarnIfOlderThanGuard(chosenPid);
+
             if (!_authorizer.TryOpenLease(chosenPid, _settings.LeaseDuration, out string why))
             {
                 Log($"unlock failed: {why}");
@@ -536,6 +547,84 @@ public partial class MainWindow : Window
         {
             BtnUnlock.IsEnabled = _protectedModeAvailable;
             RefreshState();
+        }
+    }
+
+    /// <summary>
+    /// A browser that was already running when the guard was turned on may never
+    /// have seen the proxy setting.
+    ///
+    /// Browsers read the Windows proxy configuration at startup. Some notice a
+    /// later change and some do not — Firefox in particular caches it, and a
+    /// Firefox that believes there is no proxy also enables HTTP/3, so its
+    /// traffic leaves over UDP and does not pass the guard even in principle.
+    ///
+    /// From inside the application this is indistinguishable from success: the
+    /// registry is written, the read-back confirms it, the listener is up, the
+    /// lease is open — and nothing ever arrives. It cost three days to find by
+    /// hand. The process start time answers it in one comparison.
+    /// </summary>
+    private void WarnIfOlderThanGuard(int pid)
+    {
+        if (_guardOnAt == DateTime.MaxValue) return;      // guard is not on
+        var identity = _resolver.Describe(pid);
+        if (identity is null || identity.StartTime >= _guardOnAt) return;
+
+        Log($"note: this browser (pid {pid}) started at {identity.StartTime:HH:mm:ss}, " +
+            $"before the guard was turned on at {_guardOnAt:HH:mm:ss}");
+        MessageBox.Show(
+            "This browser was already running when the guard was turned on.\n\n" +
+            "Browsers read the Windows proxy setting when they start, and some " +
+            "never notice a later change — so this one may still be sending its " +
+            "traffic straight past SessionGuard.\n\n" +
+            "If nothing appears in the log while you browse, close the browser " +
+            "completely and start it again now.",
+            "SessionGuard", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    /// <summary>
+    /// Writes the root certificate out as a file.
+    ///
+    /// Windows trust is not universal trust. Adding the root to the user's
+    /// Windows store covers Chrome and Edge, and covers nothing in Firefox,
+    /// which keeps its own <c>cert9.db</c> per profile. The two are independent
+    /// walls and they fail in the wrong order: traffic has to reach the guard
+    /// before a certificate error can even appear, so the second problem stays
+    /// hidden until the first is solved.
+    ///
+    /// Only the public certificate is exported — never the private key, which
+    /// stays under DPAPI. A file is as far as this goes: writing into another
+    /// application's certificate store is that application's business, and a
+    /// tool that edits browser profiles behind the user's back is the shape of
+    /// the thing this project exists to defend against.
+    /// </summary>
+    private void BtnExportCa_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            string path = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                "SessionGuard-root-CA.cer");
+            File.WriteAllBytes(path, _ca.Root.Export(X509ContentType.Cert));
+            Log("root CA exported to " + path);
+            MessageBox.Show(
+                "Saved to:\n\n" + path + "\n\n" +
+                "Chrome and Edge use the Windows store and already trust it.\n\n" +
+                "Firefox keeps its own certificate store, so it needs one of:\n\n" +
+                "  • about:config -> security.enterprise_roots.enabled = true\n" +
+                "    (Firefox then reads the Windows store; nothing to import)\n\n" +
+                "  • Settings -> Privacy & Security -> Certificates ->\n" +
+                "    View Certificates -> Authorities -> Import -> this file,\n" +
+                "    ticking \"Trust this CA to identify websites\"\n\n" +
+                "Restart the browser afterwards — and start it after the guard " +
+                "is on, or it may not pick up the proxy setting.",
+                "SessionGuard root certificate");
+        }
+        catch (Exception ex)
+        {
+            Log("could not export root CA: " + ex.Message);
+            MessageBox.Show(ex.Message, "SessionGuard",
+                            MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
@@ -567,6 +656,21 @@ public partial class MainWindow : Window
                              $"({(mode == PresenceMode.None ? "no presence check" : PresenceSettings.Describe(mode))})";
             LeaseText.Foreground = Brush(mode == PresenceMode.None ? "#E5484D" : "#30A46C");
         }
+        else if (_denied > 0)
+        {
+            // The state that cost days to recognise. Interception is running and
+            // the lease is shut, so guarded cookies are taken out of the browser
+            // and never put back: protected sites are signed out and stay that
+            // way. Nothing is broken, everything is behaving as written — and
+            // from the browser it looks exactly like the site rejecting you.
+            //
+            // "Locked" alone did not carry that. A count of requests actually
+            // sent without their session does.
+            LeaseText.Text =
+                $"LOCKED — {_denied} request(s) sent without their session.\n" +
+                "Protected sites will act signed-out until you press Unlock.";
+            LeaseText.Foreground = Brush("#E5484D");
+        }
         else
         {
             LeaseText.Text = "Locked — requests go out without the session";
@@ -576,13 +680,30 @@ public partial class MainWindow : Window
         try
         {
             string state = _sysProxy.ReadBack();
-            ProxyStateText.Text = state;
             // Amber when the app is on but Windows does not agree — that is the
             // case worth noticing, and the one that used to need a trip to
             // Internet Options to diagnose.
             bool windowsAgrees = state.Contains($"127.0.0.1:{ListenPort}");
+            bool disagreement = on != windowsAgrees;
+
+            // The registry saying ON only means Windows was told. Whether any
+            // browser is actually listening to it is a different question, and
+            // it has its own answer: connections arriving, or not. A guard that
+            // has been on for a while and has seen nothing is not protecting
+            // anything, and saying so beats leaving the user to infer it from
+            // an empty vault.
+            string silent = "";
+            if (on && windowsAgrees && _connections == 0 &&
+                DateTime.Now - _guardOnAt > TimeSpan.FromSeconds(45))
+            {
+                silent = $"\nno connections in {(DateTime.Now - _guardOnAt).TotalMinutes:F0} min — " +
+                         "nothing is using this proxy. Check the browser's own proxy setting, " +
+                         $"and that it runs as {Environment.UserDomainName}\\{Environment.UserName}.";
+            }
+
+            ProxyStateText.Text = state + silent;
             ProxyStateText.Foreground = Brush(
-                on == windowsAgrees ? "#8B93A1" : "#F5A524");
+                disagreement || silent.Length > 0 ? "#F5A524" : "#8B93A1");
         }
         catch (Exception ex)
         {
@@ -655,6 +776,11 @@ public partial class MainWindow : Window
         {
             handled++;
             Log(ev.ToString());
+
+            if (ev.Kind is "tunnel" or "intercept" or "tunnel_unprotected")
+                _connections++;
+            if (ev.Kind == "injection_denied") _denied++;
+            if (ev.Kind == "injected") _denied = 0;   // the lease is doing its job now
 
             // Independent of the Logging checkbox: this drives the Vault panel,
             // which states what is deliberately left unprotected. Turning off
@@ -733,6 +859,9 @@ public partial class MainWindow : Window
         _logging = true;                        // a header is worth an exception
         Log($"--- {why} ---");
         Log($"  guard: {(_engine?.IsRunning == true ? $"on, listening on 127.0.0.1:{_engine.ListenPort}" : "off")}");
+        if (_engine?.IsRunning == true)
+            Log($"  connections since turn on: {_connections}" +
+                (_connections == 0 ? "  <-- nothing is using this proxy" : ""));
         try { Log($"  windows: {_sysProxy.ReadBack()}"); } catch { }
         var hosts = _hosts.Load();
         Log($"  protected hosts: {(hosts.Count == 0 ? "(none)" : string.Join(", ", hosts))}");
