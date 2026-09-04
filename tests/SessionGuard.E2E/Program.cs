@@ -52,7 +52,7 @@ public static class Program
         };
         h2Service.Start();
 
-        var sealer = new EphemeralSealer();
+        var sealer = new SoftwareSealer();
         var vault = new SessionVault(sealer);
         var lease = new PresenceLease();
         var authorizer = new PeerAuthorizer(new ProcNetPeerResolver(), lease);
@@ -154,6 +154,64 @@ public static class Program
         int lines = bulkBody.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length;
         Check("chunked body of 4000 lines arrives intact", lines == 4000,
               $"{lines} lines, {bulkBody.Length} bytes");
+
+        // 2b ------------------------------ evicting a pre-existing copy
+        Section("2b. A copy the browser already had is evicted");
+
+        // The case the guard cannot prevent by capture: a cookie the browser
+        // acquired before the guard was ever running. Nothing in Set-Cookie
+        // handling reaches it, requests still succeed because it is stripped
+        // and the vault's copy is injected, and it sits in the profile the
+        // whole time — which is exactly where a cookie thief looks.
+        jar.Add(new Uri(baseUrl), new Cookie("sessionid", "stale-copy-from-before")
+        {
+            Domain = ProtectedHost,
+            Path = "/",
+            Secure = true,
+        });
+        Check("the browser starts out holding its own copy",
+              jar.GetCookies(new Uri(baseUrl)).Cast<Cookie>().Any(c => c.Name == "sessionid"));
+
+        var evict = await client.GetAsync($"{baseUrl}/me");
+        Check("the request still succeeds — the vault's copy is what goes upstream",
+              evict.StatusCode == HttpStatusCode.OK,
+              $"HTTP {(int)evict.StatusCode}");
+
+        var afterEvict = jar.GetCookies(new Uri(baseUrl)).Cast<Cookie>().ToList();
+        Check("and the browser's own copy is gone from the jar",
+              afterEvict.All(c => c.Name != "sessionid"),
+              $"jar=[{string.Join(",", afterEvict.Select(c => c.Name))}]");
+        Check("the vault still holds it",
+              vault.Names(ProtectedHost).Contains("sessionid"),
+              string.Join(",", vault.Names(ProtectedHost)));
+
+        var stillWorks = await client.GetAsync($"{baseUrl}/me");
+        Check("the session survives the eviction",
+              stillWorks.StatusCode == HttpStatusCode.OK,
+              $"HTTP {(int)stillWorks.StatusCode}");
+
+        // The worse case, and the quieter one: a cookie the guard never saw at
+        // all. Signing in before the browser was actually routed through the
+        // proxy puts the whole login in the profile; the guard then works
+        // perfectly on everything afterwards, and the one credential that
+        // matters is the one it never had a chance to take. Nothing looks wrong.
+        jar.Add(new Uri(baseUrl), new Cookie("legacy_session", "never-seen-by-the-guard")
+        {
+            Domain = ProtectedHost,
+            Path = "/",
+            Secure = true,
+        });
+        await client.GetAsync($"{baseUrl}/me");
+
+        lock (log)
+        {
+            Check("a cookie the guard never saw is reported, not ignored",
+                  log.Any(l => l.Contains("never_captured") && l.Contains("legacy_session")),
+                  log.LastOrDefault(l => l.Contains("never_captured")) ?? "(no such event)");
+        }
+        Check("and it is not in the vault, because it never passed through",
+              !vault.Names(ProtectedHost).Contains("legacy_session"),
+              string.Join(",", vault.Names(ProtectedHost)));
 
         // 3 ------------------------------------------- unprotected host
         Section("3. Unprotected traffic is untouched");

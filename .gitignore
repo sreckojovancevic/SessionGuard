@@ -28,3 +28,5 @@ protected-hosts.txt
 # OS
 Thumbs.db
 .DS_Store
+
+_to_delete/

@@ -36,6 +36,40 @@ public enum PresenceMode
     None,
 }
 
+/// <summary>Which implementation seals the vault.</summary>
+public enum VaultEngine
+{
+    /// <summary>
+    /// TPM when the machine has a usable one, software otherwise — and the
+    /// window says which was chosen. Automatic must never mean silent: a
+    /// downgrade the user cannot see is the failure this project is written
+    /// against.
+    /// </summary>
+    Automatic,
+
+    /// <summary>
+    /// TPM 2.0 only. If the chip is missing, locked out or refuses, the
+    /// application does not run rather than quietly protecting less. Choose it
+    /// when the machine-binding claim must hold or nothing should happen.
+    /// </summary>
+    Tpm,
+
+    /// <summary>
+    /// AES-256-GCM under a process-memory key. Works on any CPU, and is
+    /// hardware-accelerated on anything since about 2010 — which is the point:
+    /// TPM 2.0 is not, and an older workstation, a virtual machine without a
+    /// vTPM, or a TPM 1.2 machine otherwise gets no protection at all.
+    ///
+    /// It is also the way out when a TPM is present but obstructive: locked out
+    /// by its dictionary-attack defence, or raising consent prompts a remote
+    /// session never displays.
+    ///
+    /// Gives up machine binding. Keeps the property that matters most in
+    /// practice — the cookie is never in the browser profile.
+    /// </summary>
+    Software,
+}
+
 /// <summary>
 /// Persisted preferences. Kept beside the host list so both can be changed
 /// without rebuilding.
@@ -45,7 +79,8 @@ public sealed class PresenceSettings
 {
     private sealed record Doc(
         [property: JsonConverter(typeof(JsonStringEnumConverter))] PresenceMode PresenceMode,
-        int LeaseMinutes);
+        int LeaseMinutes,
+        [property: JsonConverter(typeof(JsonStringEnumConverter))] VaultEngine Engine = VaultEngine.Automatic);
 
     private static readonly JsonSerializerOptions Json = new()
     {
@@ -72,6 +107,12 @@ public sealed class PresenceSettings
     {
         get => _doc.PresenceMode;
         set { _doc = _doc with { PresenceMode = value }; Save(); }
+    }
+
+    public VaultEngine Engine
+    {
+        get => _doc.Engine;
+        set { _doc = _doc with { Engine = value }; Save(); }
     }
 
     public TimeSpan LeaseDuration => TimeSpan.FromMinutes(Math.Clamp(_doc.LeaseMinutes, 1, 240));
@@ -114,6 +155,14 @@ public sealed class PresenceSettings
         PresenceMode.TpmConsent => "TPM consent prompt (per use)",
         PresenceMode.None => "None — unlock is just a click",
         _ => mode.ToString(),
+    };
+
+    public static string Describe(VaultEngine engine) => engine switch
+    {
+        VaultEngine.Automatic => "Automatic — TPM if this machine has one",
+        VaultEngine.Tpm => "TPM 2.0 only — refuse to run without it",
+        VaultEngine.Software => "Software AES-256-GCM — works on any machine",
+        _ => engine.ToString(),
     };
 
     public static string Caveat(PresenceMode effective) => effective switch

@@ -198,6 +198,49 @@ The vault fills up even while the UI says *Locked*: capture does not need a
 lease, only injection does. Non-exportability comes from `ExportPolicy.None` on
 the TPM key, not from the presence mode.
 
+## Vault engine
+
+TPM 2.0 is not universal. Older workstations, virtual machines without a vTPM,
+and anything still on TPM 1.2 have none — and on those the application used to
+refuse to run at all, which is not protection but absence. AES-GCM, by contrast,
+works on every CPU and has been hardware-accelerated since about 2010.
+
+So the engine is a choice:
+
+| Engine | Uses | Claim |
+|---|---|---|
+| **Automatic** (default) | TPM if the machine has a usable one, software otherwise | whichever it got — stated in the header |
+| **TPM 2.0 only** | TPM, or nothing | the vault cannot be opened on another machine |
+| **Software AES-256-GCM** | any CPU | the cookie is never in the browser profile; nothing survives exit |
+
+The software engine gives up **machine binding** and keeps everything else. It
+is worth being exact about what that costs, because it is less than it sounds:
+against the attack this project was built for — an infostealer reading the
+browser's cookie database off disk — the two are equally effective, since the
+protection comes from the cookie never being written there. What the TPM adds is
+that a copy of a *persisted* vault is useless elsewhere, and the vault does not
+persist yet.
+
+What the software engine cannot offer is non-exportability. The key is in
+process memory, so anything that can read that memory has it. No software
+implementation on any operating system can do otherwise.
+
+**Automatic never downgrades silently.** When it falls back, the header reads
+`SOFTWARE VAULT — not sealed to this machine`, the sealer line names the reason,
+and the log records it. Choosing `TPM 2.0 only` makes the application refuse
+rather than fall back.
+
+### Where the TPM cost actually was
+
+Sealing wrapped a data key per cookie, so unsealing cost one TPM decryption
+*per cookie, per request* — twenty-four of them to build one Cookie header for
+TikTok. That is the envelope layout, not the chip. The default is now one data
+key, unwrapped once when the vault opens; per-request work is AES-GCM alone, and
+the TPM is asked once per run.
+
+The per-cookie layout is still used for `TPM consent prompt (per use)`, because
+there the prompt per unwrap *is* the point.
+
 ## Presence modes
 
 | Mode | At Unlock | While browsing |
@@ -222,10 +265,50 @@ Windows Hello is an experimental integration and may fail on some machines;
 
 ## Browser notes
 
-SessionGuard currently uses the Windows system proxy. Chromium-based browsers
-such as Chrome and Edge normally follow it. Firefox has its own certificate
-store; if Firefox reports a certificate error for a protected host, trust the
-SessionGuard root CA in Firefox or enable Firefox's enterprise-root integration.
+SessionGuard sets the Windows system proxy.
+
+| Browser | System proxy | Certificate store |
+|---|---|---|
+| **Edge** | works (tested) | Windows — nothing to do |
+| **Brave** | works (tested) | Windows — nothing to do |
+| **Chrome** | expected to work; same engine, not separately tested | Windows — nothing to do |
+| **Firefox Nightly** | **did not take effect** (tested) — set the proxy manually | its own — see below |
+
+**Firefox then needs two manual steps**, and they fail in an order that hides
+the second one: traffic has to reach the guard before a certificate can be
+presented at all.
+
+1. **Set the proxy by hand.** *Network Settings → Manual proxy configuration*,
+   `127.0.0.1` port `28080`, with *Also use this proxy for HTTPS* ticked.
+2. **Trust the certificate.** Firefox keeps its own store, so the root installed
+   into Windows means nothing to it. Either set
+   `security.enterprise_roots.enabled` in `about:config`, or use **Export CA**
+   and import the file under *Authorities*.
+
+### Reading the evidence
+
+The two failure modes look identical from the browser, and the log separates
+them:
+
+```text
+registry now says: system proxy ON -> 127.0.0.1:28080   <- the write went through
+connections since turn on: 0                            <- and nothing is using it
+```
+
+The first line rules SessionGuard out. The second names the browser.
+
+Chromium-based browsers read the WinINET configuration and act on the change
+notification. Firefox resolves the system proxy by a different route, and on the
+machine tested — Firefox **Nightly**, a pre-release build — it never applied the
+setting: `network.proxy.type = 5`, Firefox started *after* the guard, the
+registry confirming the proxy was on, and not one connection arriving, while
+every other application on the same machine went through it. Whether release
+Firefox behaves the same has not been established. The manual setting removes
+the step entirely and works immediately.
+
+**Start the browser after turning the guard on.** Browsers read the proxy
+setting at startup and some never notice a later change. The Unlock button warns
+when the browser you picked is older than the guard.
 
 The browser selector identifies browser processes structurally and pins the
 lease to the selected process and its descendants. This matters because
@@ -246,9 +329,14 @@ process rather than from the visible browser process itself.
   against malware already running as the same Windows user.
 - The local CA gives the application the ability to intercept configured TLS
   hosts; protect the Windows account and SessionGuard installation accordingly.
-- TPM consent mode prompts once per cookie per request, which is impractical
-  for continuous browsing.
-- Windows Hello presence is not yet working reliably; treat it as unfinished.
+- TPM consent mode prompts once per cookie per request, which is impractical for
+  continuous browsing — and every prompt left unanswered counts against the
+  TPM's dictionary-attack defence, which will eventually lock the vault out.
+  Over Remote Desktop the prompts may not appear at all while still counting.
+- Windows Hello presence is not yet working reliably; treat it as unfinished,
+  and note it cannot work over Remote Desktop at all.
+- The software vault engine is not bound to the machine; its key is in process
+  memory.
 - The project has not undergone an independent security audit.
 
 ## Testing

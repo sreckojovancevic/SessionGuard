@@ -223,6 +223,33 @@ public sealed class SessionVault
             string.Equals(kv.Key[(kv.Key.IndexOf('\n') + 1)..], n, StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// The scope the vault recorded for a guarded name, so a deletion aimed at
+    /// the browser can address the same cookie.
+    ///
+    /// Scope is not decoration here. A browser matches a deletion by name,
+    /// domain and path together: aim it at the wrong domain and, instead of
+    /// removing the cookie, you create a second empty one beside it.
+    /// </summary>
+    public bool TryGetScope(string host, string name,
+                            out string domain, out bool hostOnly, out string path)
+    {
+        foreach (var kv in For(host))
+        {
+            if (!string.Equals(kv.Key[(kv.Key.IndexOf('\n') + 1)..], name,
+                               StringComparison.Ordinal))
+                continue;
+            domain = kv.Value.Domain;
+            hostOnly = kv.Value.HostOnly;
+            path = kv.Value.Path ?? "/";
+            return true;
+        }
+        domain = string.Empty;
+        hostOnly = true;
+        path = "/";
+        return false;
+    }
+
     public static void ReturnCookieHeader(byte[] buffer, int length)
     {
         if (buffer.Length == 0) return;

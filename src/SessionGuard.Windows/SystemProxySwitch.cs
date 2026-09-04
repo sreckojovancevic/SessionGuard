@@ -27,9 +27,11 @@ namespace SessionGuard.Windows;
 ///                              *before* the registry is touched, and reconciled
 ///                              at the next startup.
 ///
-/// Note this is WinINET. Chrome and Edge follow it, and so does Firefox, whose
-/// default is "use system proxy settings" — Firefox's obstacle here is its
-/// separate certificate store, not the proxy setting.
+/// Note this is WinINET. Edge and Brave follow it, both confirmed, and Chrome
+/// is expected to on the same engine. Firefox is meant to as well — its default
+/// is "use system proxy settings" — but on Firefox Nightly it was observed never
+/// to take effect, so that browser needs the proxy set by hand. Firefox also
+/// keeps its own certificate store, which is a separate obstacle again.
 /// </summary>
 [SupportedOSPlatform("windows")]
 public sealed class SystemProxySwitch

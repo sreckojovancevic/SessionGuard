@@ -312,6 +312,76 @@ recycled PID does not automatically inherit the old lease.
 
 ---
 
+## 6a. Vault engine
+
+The **Vault** selector decides what seals the vault. It is a separate question
+from **Check**, which decides what proves a person is present.
+
+| Engine | Uses | Available |
+|---|---|---|
+| **Automatic** (default) | TPM if usable, software otherwise | always |
+| **TPM 2.0 only** | TPM, or refuses to run | machines with TPM 2.0 |
+| **Software AES-256-GCM** | any CPU | always |
+
+**Why the choice exists.** TPM 2.0 is not universal — older workstations,
+virtual machines without a vTPM and TPM 1.2 machines have none, and on those the
+application would otherwise refuse to start. AES-GCM runs everywhere, and is
+hardware-accelerated on anything since roughly 2010.
+
+**What the software engine gives up: machine binding, and nothing else.**
+Against the attack this was built for — an infostealer reading the browser's
+cookie database off disk — the two engines are equally effective, because the
+protection comes from the cookie never being written there. When the application
+exits, the software key and everything it held are gone, so a powered-off
+machine holds nothing at all.
+
+What it cannot offer is non-exportability. The key sits in this process's
+memory, so anything that can read that memory has it, along with every entry in
+the same snapshot. A TPM key is created inside the chip and cannot be read out
+even by the process using it — a property no software implementation can
+provide, on any operating system.
+
+**Automatic never downgrades quietly.** On fallback the header reads:
+
+```text
+SOFTWARE VAULT — not sealed to this machine
+```
+
+and the sealer line and the log both name the reason. If a machine should refuse
+to run rather than protect less, set the engine to **TPM 2.0 only**.
+
+**Changing the engine changes the key**, so the vault becomes unreadable and you
+will be signed out of protected sites. The application asks before doing it.
+
+### Two reasons to choose Software on a machine that has a TPM
+
+Both were met in practice, not in theory:
+
+1. **The TPM locked itself out.** Repeated per-use consent prompts left
+   unanswered trip its dictionary-attack defence, after which nothing opens —
+   including **Reset key**, which has to open the key in order to delete it.
+2. **Remote Desktop.** Consent prompts may never be displayed in a remote
+   session while still counting as failed authorizations, and Windows Hello
+   cannot work there at all.
+
+### Where the TPM cost actually was
+
+Sealing wrapped a data key per cookie, so unsealing cost one TPM decryption *per
+cookie, per request* — twenty-four of them to assemble one Cookie header for
+TikTok, and in consent mode twenty-four dialogs. That was the envelope layout,
+not the chip.
+
+The default is now one data key, unwrapped once when the vault opens and held in
+memory; per-request work is AES-GCM alone. The TPM still binds the vault to this
+machine, but is asked once per run instead of per use.
+
+The per-cookie layout is kept for **TPM consent prompt (per use)**, where a
+prompt per unwrap is exactly what was asked for. That is the honest trade, and
+it is why the two live side by side: *the fast path turns per-use consent into
+per-run consent.*
+
+---
+
 ## 7. Presence / Unlock policy
 
 ### Three independent layers
@@ -378,6 +448,33 @@ per cookie per request**. A site with three session cookies therefore produces
 three Windows dialogs for every HTTP request. This is a deliberate, very strong
 per-use authorization, and it is not usable for ordinary browsing. Treat it as
 a mode for occasional, high-value access rather than a daily default.
+
+**It can also lock the TPM out of your own vault.** Every prompt that is asked
+for and not answered counts, to the chip, as a failed authorization — whether
+you dismissed it, or it never appeared because the session is a Remote Desktop
+one. Enough of them and the TPM's dictionary-attack defence starts refusing:
+
+```text
+no TPM-backed key: The Platform Crypto Device has ignored the authorization
+for the provider object, to mitigate against a dictionary attack.
+```
+
+Nothing is damaged and no key is lost; the chip is declining to answer for a
+while. Note that `Get-Tpm` will still report `LockedOut : False` — that field is
+about owner authorization, while the Platform Crypto Provider keeps its own
+counters. `LockoutCount` is the number that matters, and `LockoutHealTime` is
+how long one count takes to decay.
+
+To recover:
+
+1. **Wait**, or clear it with `Reset-TpmLockout` (needs owner authorization).
+   **Never `Clear-Tpm`** — that wipes every TPM key on the machine, BitLocker
+   and Windows Hello included.
+2. Then set **Check** to `None` and press **Reset key**, so the new key carries
+   no per-use consent and cannot trigger this again.
+
+Step 2 has to come second: **Reset key** must open the existing key in order to
+delete it, so it fails the same way while the chip is still refusing.
 
 ### Windows Hello
 
@@ -518,6 +615,90 @@ guarded even if a later `Set-Cookie` for it omits `HttpOnly`. Otherwise a
 server's deletion header would pass by and leave a dead credential in the vault
 forever.
 
+### Cookies the guard never saw at all — the quiet failure
+
+Worse than a copy left behind is a credential the guard never had a chance to
+take. It happens for one reason, and it happened during development more than
+once:
+
+> **Signing in before the browser is actually going through the proxy.**
+
+The whole login lands in the browser profile. The guard then works perfectly on
+everything afterwards — intercepting, capturing device tokens, injecting — while
+the one cookie that matters is the one it never saw. The vault fills with
+plausible-looking entries, the site works, and nothing is protected.
+
+There is no way to tell that apart from success by looking at the site. So the
+guard says it:
+
+```text
+never_captured  www.tiktok.com  sessionid,sid_guard — the browser had these
+                before the guard saw them, so they are NOT protected. If any is
+                a session cookie, sign out and sign in again with the guard
+                running.
+```
+
+and the Vault panel turns red:
+
+```text
+NOT PROTECTED — 6 cookie(s) the guard never saw: sessionid, sid_guard, ...
+```
+
+The distinction it draws is between a cookie the guard *decided* about — vaulted,
+left alone as script-readable, or refused for its scope — and one it never
+witnessed. The first three are informed outcomes. The fourth is a blind spot.
+
+**The fix is always the same: sign out, then sign in again with the guard
+running and the lease open.** Only a fresh `Set-Cookie` can be captured.
+
+### Copies the browser already had
+
+Capturing a cookie from `Set-Cookie` stops it ever reaching the browser — but
+only for cookies issued **while the guard was running**. One the browser
+already had, from before the guard was ever turned on, is untouched by that.
+
+This is easy to miss, because everything looks correct: the vault holds the
+cookie, requests carry the vault's copy because the browser's is stripped on
+the way out, and the site works normally — while `sessionid` sits in the
+browser profile on disk, exactly where a cookie thief reads it.
+
+The log names it. `stripped_client_cookie` means the browser sent a guarded
+name, which means it still has its own copy:
+
+```text
+stripped_client_cookie www.tiktok.com  sessionid,sid_guard,sessionid_ss,...
+```
+
+SessionGuard now asks the browser to delete those, using the mechanism the site
+itself would use — a `Set-Cookie` with `Max-Age=0`, addressed to the same name,
+domain and path:
+
+```text
+evict_from_browser  www.tiktok.com  sessionid,sid_guard — the vault holds these;
+                                    asking the browser to drop its own copy
+```
+
+The session does not break: the vault keeps injecting its copy.
+
+Two details, both learned by measurement rather than assumed:
+
+- **Scope has to match.** A browser matches a deletion on name, domain *and*
+  path. A host-only deletion leaves a domain cookie of the same name untouched,
+  and the reverse. A request header carries only names — RFC 6265 sends no
+  scope with them — so there is no way to learn how the browser's copy is
+  scoped, and both shapes are sent.
+- **A stray deletion is harmless here.** If one lands where no cookie exists it
+  creates an empty one; outbound stripping works by name, so that stray is
+  removed from the next request and never reaches the site.
+
+If the browser keeps sending a name well after the deletion was sent, it did not
+take, and that is reported rather than retried forever:
+
+```text
+eviction_ignored  host  name — still in the browser profile after the deletion
+                  was sent; these remain readable from disk
+```
+
 ### Domain
 
 A cookie with:
@@ -562,8 +743,67 @@ something must not mean destroying it.
 
 ## 11. Firefox
 
-Firefox can use the system proxy, but it maintains its own certificate trust
-store.
+Firefox needs two things done to it that Edge and Brave do not. They are
+independent, and they fail in an order that hides the second one — traffic has
+to reach the guard before a certificate can be presented at all.
+
+### What was actually tested
+
+| Browser | System proxy | Certificate store |
+|---|---|---|
+| **Edge** | works | Windows — nothing to do |
+| **Brave** | works | Windows — nothing to do |
+| **Chrome** | expected to work; same engine, not separately tested | Windows — nothing to do |
+| **Firefox Nightly** | did not take effect | its own — needs a step |
+
+Two of three Chromium-based browsers were confirmed working, so the Windows
+system-proxy mechanism itself is not the problem, and neither is what
+SessionGuard writes.
+
+### Telling the two failures apart
+
+They look identical from the browser, so the log separates them:
+
+```text
+registry now says: system proxy ON -> 127.0.0.1:28080   <- the write went through
+connections since turn on: 0                            <- and nothing is using it
+```
+
+The first line rules SessionGuard out. The second names the browser.
+
+### Set the proxy manually. "Use system proxy settings" is not enough.
+
+Firefox's default is to follow the Windows proxy, and in principle that is
+correct. In practice, on the machine this was developed against — running
+Firefox **Nightly**, a pre-release build — it never applied the setting: with
+`network.proxy.type = 5`, a Firefox started *after* the guard, and the registry
+confirming `system proxy ON`, **not one connection ever reached the proxy**,
+while every other application on the same machine went through it.
+
+Chromium browsers read the WinINET configuration and act on its change
+notification; Firefox resolves the system proxy by a different route and caches
+the result. Whether release Firefox behaves the same has not been established —
+what is established is that the manual setting removes the step entirely and
+works immediately.
+
+Setting it by hand works immediately:
+
+```text
+Settings -> Network Settings -> Settings…
+  -> Manual proxy configuration
+     HTTP Proxy:  127.0.0.1     Port: 28080
+     [x] Also use this proxy for HTTPS
+```
+
+Treat it as the required step for Firefox rather than as a workaround, at least
+until someone confirms release Firefox behaves differently.
+
+Edge and Brave follow the Windows setting without any of this.
+
+### Trust the certificate
+
+Firefox also maintains its own certificate store, so the root SessionGuard
+installs into the Windows store means nothing to it.
 
 These are two independent walls, and they fail in an order that hides the
 second one. Traffic has to reach the guard before a certificate can be

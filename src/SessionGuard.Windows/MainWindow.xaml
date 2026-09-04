@@ -87,6 +87,19 @@
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Vault" Style="{StaticResource Label}"
+                               VerticalAlignment="Center" Margin="0,0,10,0"/>
+                    <ComboBox x:Name="CmbEngine" Grid.Column="1" Height="28"
+                              VerticalContentAlignment="Center"
+                              Background="#2A2E37" Foreground="#111111"
+                              ToolTip="Which implementation seals the vault"
+                              SelectionChanged="CmbEngine_Changed"/>
+                </Grid>
+                <Grid Margin="0,0,0,8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>

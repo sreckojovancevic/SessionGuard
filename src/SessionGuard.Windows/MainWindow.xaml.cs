@@ -92,6 +92,7 @@ public partial class MainWindow : Window
         _timer.Tick += (_, _) => { DrainEvents(); RefreshState(); FlushLog(); };
         _timer.Start();
 
+        PopulateEngines();
         PopulatePresenceModes();
         PopulateBrowsers();
         LoadHosts();
@@ -114,6 +115,16 @@ public partial class MainWindow : Window
         _vault = null;
 
         bool wantConsent = _settings.Mode == PresenceMode.TpmConsent;
+
+        // Chosen deliberately: no TPM is attempted at all, so a locked-out or
+        // prompt-happy chip cannot get in the way of a mode that does not use it.
+        if (_settings.Engine == VaultEngine.Software)
+        {
+            UseSoftwareSealer(chosenDeliberately: true, why: null);
+            BtnToggle.IsEnabled = _protectedModeAvailable;
+            BtnUnlock.IsEnabled = _protectedModeAvailable;
+            return;
+        }
 
         try
         {
@@ -141,33 +152,111 @@ public partial class MainWindow : Window
                 SealerText.Foreground = Brush("#8B93A1");
             }
         }
-        catch (Exception ex) when (_devMode)
+        catch (Exception ex) when (_settings.Engine == VaultEngine.Automatic || _devMode)
         {
-            var eph = new EphemeralSealer();
-            _sealer = eph;
-            _vault = new SessionVault(eph);
-            _protectedModeAvailable = true;
-            SubtitleText.Text = "INSECURE DEV MODE — vault is RAM only";
-            SubtitleText.Foreground = Brush("#E5484D");
-            SealerText.Text = $"sealer: {eph.Name} — TPM unavailable ({ex.GetType().Name}); " +
-                              "this is not a security boundary";
-            Log($"running in insecure dev mode: {ex.Message}");
+            // Automatic: fall back, but never quietly. The header changes, the
+            // sealer line names the reason, and the log records it — so the
+            // difference between "sealed to this TPM" and "sealed in memory" is
+            // never something the user has to go looking for.
+            UseSoftwareSealer(chosenDeliberately: false,
+                              why: $"{ex.GetType().Name}: {ex.Message}");
         }
         catch (Exception ex)
         {
-            // Fail closed: a security product that silently drops to a RAM-only
-            // vault when its hardware root is missing is worse than one that
-            // refuses, because the user believes they are protected.
+            // Engine is TPM by explicit choice: refuse rather than protect less
+            // than was asked for. A security product that silently drops to a
+            // weaker vault when its hardware root is missing is worse than one
+            // that stops, because the user believes they are protected.
             _protectedModeAvailable = false;
             SubtitleText.Text = "PROTECTED MODE UNAVAILABLE";
             SubtitleText.Foreground = Brush("#E5484D");
             SealerText.Text = "no TPM-backed key: " + ex.Message;
             Log("protected mode unavailable — refusing to run without a hardware-sealed vault");
+
+            // The reason belongs in the log, not only on the window. A saved log
+            // is what gets sent to someone who can read it, and "unavailable"
+            // without the cause makes that log useless — the difference between
+            // a locked-out TPM, a key whose policy cannot be met in this session,
+            // and no TPM at all is the whole diagnosis.
+            Log($"  reason: {ex.GetType().Name}: {ex.Message}");
+            if (ex is System.Security.Cryptography.CryptographicException ce)
+                Log($"  win32: 0x{ce.HResult:X8}");
+            Log($"  presence mode requested: {PresenceSettings.Describe(_settings.Mode)}");
+
+            // One failure deserves its own explanation, because the provider's
+            // own wording gives no remedy and the cause is a setting in this
+            // window. The TPM counts every authorization it is asked for and
+            // does not get — and a per-use consent prompt that is dismissed, or
+            // that never appears because the session is remote, is exactly that.
+            // Enough of them and the chip stops answering for a while.
+            if (ex.Message.Contains("dictionary attack", StringComparison.OrdinalIgnoreCase))
+            {
+                SealerText.Text =
+                    "the TPM is refusing for now: too many unanswered authorizations " +
+                    "(its dictionary-attack defence). Wait for it to heal, then set " +
+                    "Check to 'None' before pressing Reset key.";
+                Log("  this is the TPM's dictionary-attack defence, not a broken key.");
+                Log("  cause: authorizations that were asked for and not given. The " +
+                    "'TPM consent prompt (per use)' mode asks per cookie per request, " +
+                    "and over Remote Desktop those prompts may never appear at all.");
+                Log("  it heals on its own — 'Get-Tpm' shows LockoutCount and " +
+                    "LockoutHealTime (one count per heal interval).");
+                Log("  to clear it now:  Reset-TpmLockout   (needs owner auth; do NOT " +
+                    "run Clear-Tpm, which wipes every TPM key on the machine including " +
+                    "BitLocker and Windows Hello).");
+                Log("  then set Check to 'None' and press Reset key, so the new key " +
+                    "carries no per-use consent and cannot re-trigger this.");
+                Log("  note: Reset key has to open the existing key to delete it, so it " +
+                    "will fail the same way until the TPM heals. Wait first.");
+            }
+
             Log($"start with {InsecureDevFlag} only if you are testing.");
         }
 
         BtnToggle.IsEnabled = _protectedModeAvailable;
         BtnUnlock.IsEnabled = _protectedModeAvailable;
+    }
+
+    /// <summary>
+    /// Opens the software-sealed vault, and says so where it cannot be missed.
+    ///
+    /// The wording differs by how we arrived here, because the two are not the
+    /// same event. A deliberate choice is a decision the user made and should
+    /// see confirmed; a fallback is something that happened to them, and the
+    /// reason has to travel with it.
+    /// </summary>
+    private void UseSoftwareSealer(bool chosenDeliberately, string? why)
+    {
+        var soft = new SoftwareSealer();
+        _sealer = soft;
+        _vault = new SessionVault(soft);
+        _protectedModeAvailable = true;
+
+        SubtitleText.Text = "SOFTWARE VAULT — not sealed to this machine";
+        SubtitleText.Foreground = Brush("#F5A524");
+        SealerText.Foreground = Brush("#F5A524");
+        SealerText.Text =
+            $"sealer: {soft.Name} — the key lives in this process's memory, so the " +
+            "vault is not bound to this machine. Session cookies still never reach " +
+            "the browser profile, and nothing survives exit.";
+
+        if (chosenDeliberately)
+        {
+            Log($"vault engine: {PresenceSettings.Describe(VaultEngine.Software)} (chosen)");
+        }
+        else
+        {
+            SealerText.Text += "  |  the TPM was tried first and refused.";
+            Log("vault engine: TPM unavailable, fell back to software");
+            if (why is not null) Log("  reason: " + why);
+            Log("  set the engine to 'TPM 2.0 only' if this machine should refuse " +
+                "to run without hardware sealing.");
+        }
+
+        if (_settings.Mode == PresenceMode.TpmConsent)
+            Log("note: the software vault has no per-use consent, so the presence " +
+                "check is effectively None. The lease still expires and is still " +
+                "pinned to one browser.");
     }
 
     private async void BtnResetKey_Click(object sender, RoutedEventArgs e)
@@ -276,6 +365,13 @@ public partial class MainWindow : Window
         Log("turn on: writing the system proxy setting");
         _sysProxy.Apply($"127.0.0.1:{ListenPort}");
         Log($"guard on; system proxy -> 127.0.0.1:{ListenPort}");
+
+        // The same check as at Unlock, from the other side. Unlocking before
+        // turning the guard on is a perfectly reasonable thing to do, and it
+        // silently skipped the warning: at that moment there was no guard to
+        // compare the browser's start time against. A check that only fires in
+        // one order is not a check.
+        if (_lease.IsActive) WarnIfOlderThanGuard(_lease.PinnedPid);
     }
 
     private async Task TurnOffAsync()
@@ -401,6 +497,58 @@ public partial class MainWindow : Window
         public override string ToString() => Label;
     }
 
+    private sealed record EngineChoice(VaultEngine Engine, string Label)
+    {
+        public override string ToString() => Label;
+    }
+
+    private void PopulateEngines()
+    {
+        _loadingModes = true;
+        var choices = new[] { VaultEngine.Automatic, VaultEngine.Tpm, VaultEngine.Software }
+            .Select(v => new EngineChoice(v, PresenceSettings.Describe(v))).ToArray();
+        CmbEngine.ItemsSource = choices;
+        CmbEngine.SelectedIndex =
+            Math.Max(0, Array.FindIndex(choices, c => c.Engine == _settings.Engine));
+        _loadingModes = false;
+    }
+
+    /// <summary>
+    /// Changing the engine changes the key, so everything sealed under the old
+    /// one is unreadable. Saying that before the change rather than after is the
+    /// difference between a warning and an apology.
+    /// </summary>
+    private async void CmbEngine_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (_loadingModes) return;
+        if (CmbEngine.SelectedItem is not EngineChoice choice) return;
+        if (choice.Engine == _settings.Engine) return;
+
+        if (_vault is { } v && v.Hosts.Count > 0)
+        {
+            var answer = MessageBox.Show(
+                "Changing the vault engine changes the key that protects it.\n\n" +
+                "Everything currently held becomes unreadable, so you will be " +
+                "signed out of protected sites and will have to log in again.\n\n" +
+                "Continue?",
+                "SessionGuard", MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+            if (answer != MessageBoxResult.OK)
+            {
+                PopulateEngines();     // put the selection back
+                return;
+            }
+        }
+
+        _settings.Engine = choice.Engine;
+        Log($"vault engine set to: {PresenceSettings.Describe(choice.Engine)}");
+
+        if (_engine is not null) await TurnOffAsync();
+        _leftAlone.Clear();
+        OpenVault();
+        RefreshPresenceCaveat();
+        RefreshState();
+    }
+
     private void CmbPresenceMode_Changed(object sender, SelectionChangedEventArgs e)
     {
         if (_loadingModes) return;
@@ -520,13 +668,24 @@ public partial class MainWindow : Window
 
             if (CmbBrowsers.SelectedItem is BrowserScanner.Candidate { Name: "firefox" })
             {
-                // Firefox does use the Windows system proxy by default, but it
-                // keeps its own certificate store, so the interception root has
-                // to be trusted there separately.
-                Log("firefox selected: it follows the system proxy, but uses its own " +
-                    "certificate store — enable security.enterprise_roots in about:config " +
-                    "or import the SessionGuard root manually, or protected sites will " +
-                    "show a certificate error");
+                // Two Firefox-specific walls, and the order matters: nothing can
+                // fail on the certificate until traffic actually arrives.
+                //
+                // The proxy one is stated as observation, not theory. Firefox's
+                // default is to follow the Windows setting and in principle that
+                // works; in practice, on the machine this was developed against,
+                // it never picked it up — a Firefox started after the guard, the
+                // registry confirming the proxy was on, and not one connection
+                // arriving, while every other application on the same machine
+                // went through it. Setting it by hand fixed it immediately.
+                Log("firefox selected — it needs two things Edge and Brave do not:");
+                Log("  1. set the proxy BY HAND. Settings -> Network Settings -> " +
+                    $"Manual proxy configuration, 127.0.0.1 port {ListenPort}, and tick " +
+                    "'Also use this proxy for HTTPS'. 'Use system proxy settings' " +
+                    "has been observed not to take effect at all.");
+                Log("  2. trust the certificate. Firefox keeps its own store: set " +
+                    "security.enterprise_roots.enabled in about:config, or press " +
+                    "'Export CA' and import the file under Authorities.");
             }
 
             WarnIfOlderThanGuard(chosenPid);
@@ -586,7 +745,7 @@ public partial class MainWindow : Window
     /// Writes the root certificate out as a file.
     ///
     /// Windows trust is not universal trust. Adding the root to the user's
-    /// Windows store covers Chrome and Edge, and covers nothing in Firefox,
+    /// Windows store covers Edge, Brave and Chrome, and covers nothing in Firefox,
     /// which keeps its own <c>cert9.db</c> per profile. The two are independent
     /// walls and they fail in the wrong order: traffic has to reach the guard
     /// before a certificate error can even appear, so the second problem stays
@@ -609,7 +768,7 @@ public partial class MainWindow : Window
             Log("root CA exported to " + path);
             MessageBox.Show(
                 "Saved to:\n\n" + path + "\n\n" +
-                "Chrome and Edge use the Windows store and already trust it.\n\n" +
+                "Edge, Brave and Chrome use the Windows store and already trust it.\n\n" +
                 "Firefox keeps its own certificate store, so it needs one of:\n\n" +
                 "  • about:config -> security.enterprise_roots.enabled = true\n" +
                 "    (Firefox then reads the Windows store; nothing to import)\n\n" +
@@ -726,10 +885,24 @@ public partial class MainWindow : Window
         // Naming what was deliberately not taken. These cookies stay in the
         // browser profile, so they are exactly as stealable as before — and a
         // user reading a short vault list has no way to tell that from a bug.
-        LeftAloneText.Text = _leftAlone.Count == 0
-            ? ""
-            : "left with the browser (script-readable, not HttpOnly): " +
-              string.Join(", ", _leftAlone.OrderBy(x => x));
+        var lines = new List<string>();
+        if (_leftAlone.Count > 0)
+            lines.Add("left with the browser (script-readable, not HttpOnly): " +
+                      string.Join(", ", _leftAlone.OrderBy(x => x)));
+
+        // And what was never taken at all, which is the more dangerous half.
+        // An empty or thin vault beside a working site reads as success; it is
+        // the same picture as protection that never engaged.
+        var never = _engine?.NeverCaptured ?? Array.Empty<string>();
+        if (never.Count > 0)
+            lines.Add($"NOT PROTECTED — {never.Count} cookie(s) the guard never saw: " +
+                      string.Join(", ", never.OrderBy(x => x)) +
+                      ".\nThe browser had them before the guard did. If a session " +
+                      "cookie is among them, sign out and sign in again now that " +
+                      "the guard is running.");
+
+        LeftAloneText.Text = string.Join("\n", lines);
+        LeftAloneText.Foreground = Brush(never.Count > 0 ? "#E5484D" : "#F5A524");
     }
 
     private static SolidColorBrush Brush(string hex) =>
@@ -865,12 +1038,28 @@ public partial class MainWindow : Window
         try { Log($"  windows: {_sysProxy.ReadBack()}"); } catch { }
         var hosts = _hosts.Load();
         Log($"  protected hosts: {(hosts.Count == 0 ? "(none)" : string.Join(", ", hosts))}");
-        Log($"  presence: {PresenceSettings.Describe(_settings.Mode)}; " +
+        // The effective mode, not the selected one. A vault with no per-use
+        // policy cannot honour "TPM consent prompt", and a header that prints
+        // the request rather than the reality is the kind of quiet inaccuracy
+        // this log exists to eliminate.
+        var effective = EffectiveMode;
+        string presence = PresenceSettings.Describe(effective);
+        if (effective != _settings.Mode)
+            presence += $" (selected: {PresenceSettings.Describe(_settings.Mode)}, " +
+                        "not available with this vault)";
+
+        Log($"  vault engine: {PresenceSettings.Describe(_settings.Engine)}" +
+            (_sealer is null ? "" : $"  [{_sealer.Name}]"));
+        Log($"  presence: {presence}; " +
             $"lease: {(_lease.IsActive ? $"open for pid {_lease.PinnedPid}, {_lease.Remaining.TotalMinutes:F0} min left" : "locked")}");
         var scopes = _vault?.Hosts ?? Array.Empty<string>();
         Log($"  vault: {(scopes.Count == 0 ? "empty" : string.Join("; ", scopes.Select(h => $"{h}=[{string.Join(",", _vault!.Names(h))}]")))}");
         if (_leftAlone.Count > 0)
             Log($"  left to browser: {string.Join(", ", _leftAlone)}");
+        var neverSeen = _engine?.NeverCaptured ?? Array.Empty<string>();
+        if (neverSeen.Count > 0)
+            Log($"  NOT PROTECTED ({neverSeen.Count}): {string.Join(", ", neverSeen)}" +
+                "  <-- the browser had these before the guard saw them");
         Log($"  running as: {Environment.UserDomainName}\\{Environment.UserName}");
         _logging = was;
     }

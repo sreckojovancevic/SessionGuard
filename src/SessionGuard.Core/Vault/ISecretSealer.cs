@@ -5,7 +5,7 @@ namespace SessionGuard.Core.Vault;
 /// key must be usable on this machine and not extractable from it.
 ///
 /// On Windows the real implementation is TPM-backed (CNG, Microsoft Platform
-/// Crypto Provider, ExportPolicy.None). <see cref="EphemeralSealer"/> is the
+/// Crypto Provider, ExportPolicy.None). <see cref="SoftwareSealer"/> is the
 /// portable fallback and is explicitly not a security boundary — it exists so
 /// the pipeline can be tested off Windows.
 /// </summary>

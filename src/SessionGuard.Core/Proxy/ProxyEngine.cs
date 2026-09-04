@@ -63,6 +63,21 @@ public sealed class ProxyEngine : IAsyncDisposable
     private readonly ProtectedHostSet _protected;
     private readonly TcpListener _listener;
     private readonly InterceptionCache _uninterceptable;
+
+    /// <summary>host\name of cookies the browser has been asked to delete.</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _evicted = new();
+
+    /// <summary>host\name of every cookie this engine has seen a Set-Cookie for.</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _seen = new();
+
+    /// <summary>host\name already reported as never captured, so it is said once.</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _reportedUnseen = new();
+
+    /// <summary>
+    /// Cookies a protected host receives that this engine never issued and never
+    /// captured — the browser has them from before the guard was watching.
+    /// </summary>
+    public IReadOnlyCollection<string> NeverCaptured => _reportedUnseen.Keys.ToArray();
     private CancellationTokenSource? _cts;
     private Task? _acceptLoop;
 
@@ -408,7 +423,8 @@ public sealed class ProxyEngine : IAsyncDisposable
             Emit("request", host,
                 $"{method} {path}; authorized={authorized}; reason={reason}");
 
-            ApplyOutbound(request, host, path, authorized, reason);
+            var browserHeld = new List<string>();
+            ApplyOutbound(request, host, path, authorized, reason, browserHeld);
 
             byte[] reqWire = request.Serialize(out int reqLen);
             try { await WriteAsync(remote, reqWire.AsMemory(0, reqLen), token).ConfigureAwait(false); }
@@ -424,7 +440,7 @@ public sealed class ProxyEngine : IAsyncDisposable
 
             Emit("response", host,
                 $"{ResponseStatus(response)}; closeDelimited={response.CloseDelimited}");
-            ApplyInbound(response, host);
+            ApplyInbound(response, host, browserHeld);
 
             byte[] resWire = response.Serialize(out int resLen);
             try { await WriteAsync(client, resWire.AsMemory(0, resLen), token).ConfigureAwait(false); }
@@ -494,7 +510,8 @@ public sealed class ProxyEngine : IAsyncDisposable
     }
 
     private void ApplyOutbound(HttpMessage request, string host, string path,
-                               bool authorized, string reason)
+                               bool authorized, string reason,
+                               List<string> browserHeld)
     {
         var kept = new List<byte[]>();
         if (request.Head.TryGetValue(CookieHeader, out int cs, out int cl))
@@ -504,6 +521,7 @@ public sealed class ProxyEngine : IAsyncDisposable
             string h = host;
             var dropped = new List<string>();
             var passed = new List<string>();
+            var unseen = new List<string>();
 
             CookieBytes.ForEachRequestCookie(value, (name, val) =>
             {
@@ -517,13 +535,40 @@ public sealed class ProxyEngine : IAsyncDisposable
                 pair[name.Length] = (byte)'=';
                 val.CopyTo(pair.AsSpan(name.Length + 1));
                 kept.Add(pair);
-                passed.Add(Encoding.ASCII.GetString(name));
+                string kn = Encoding.ASCII.GetString(name);
+                passed.Add(kn);
+
+                // A cookie on a protected host that this engine has never seen a
+                // Set-Cookie for. The browser did not get it through the guard,
+                // so it was never a candidate for the vault — it has simply been
+                // in the profile all along.
+                //
+                // The usual cause is signing in before the browser was actually
+                // routed through the proxy: the whole login lands in the profile,
+                // the guard then works perfectly on everything else, and the one
+                // credential that matters is the one it never saw. The vault
+                // looks healthy, the site works, and nothing is protected.
+                if (!_seen.ContainsKey(h + "\n" + kn))
+                    unseen.Add(kn);
             });
 
             if (passed.Count > 0)
                 Emit("client_cookies", host, "passed=" + string.Join(",", passed));
             if (dropped.Count > 0)
+            {
                 Emit("stripped_client_cookie", host, string.Join(",", dropped));
+                // The browser sending a guarded name means it still has its own
+                // copy on disk. Stripping it here keeps the request correct but
+                // leaves that copy exactly where an infostealer looks.
+                browserHeld.AddRange(dropped);
+            }
+
+            var fresh = unseen.Where(n => _reportedUnseen.TryAdd(host + ":" + n, 0)).ToArray();
+            if (fresh.Length > 0)
+                Emit("never_captured", host,
+                     string.Join(",", fresh) + " — the browser had these before the " +
+                     "guard saw them, so they are NOT protected. If any is a session " +
+                     "cookie, sign out and sign in again with the guard running.");
         }
 
         request.Head.RemoveAll(CookieHeader);
@@ -603,7 +648,8 @@ public sealed class ProxyEngine : IAsyncDisposable
     /// script cannot touch, and <c>HttpOnly</c> is exactly the server's own
     /// marking of which ones those are.</para>
     /// </summary>
-    private void ApplyInbound(HttpMessage response, string host)
+    private void ApplyInbound(HttpMessage response, string host,
+                              IReadOnlyList<string>? browserHeld = null)
     {
         var head = response.Head;
         var captured = new List<string>();
@@ -629,6 +675,14 @@ public sealed class ProxyEngine : IAsyncDisposable
 
             var name = value[nr];
             var attrs = CookieBytes.ParseAttributes(value);
+
+            // Seen means "this engine watched the server issue it", whatever was
+            // then decided about it — vaulted, left to the browser as
+            // script-readable, or refused for its scope. All three are informed
+            // outcomes. What matters for the warning below is the fourth case:
+            // a cookie that was already in the profile and never passed here at
+            // all, which no decision was ever made about.
+            _seen.TryAdd(host + "\n" + Encoding.ASCII.GetString(name), 0);
 
             // Already-guarded names stay guarded even if this particular header
             // omits HttpOnly, so that a sign-out still reaches the vault: a
@@ -678,5 +732,101 @@ public sealed class ProxyEngine : IAsyncDisposable
             var stored = captured.Except(revoked).ToArray();
             if (stored.Length > 0) Emit("vaulted", host, string.Join(",", stored));
         }
+
+        if (browserHeld is { Count: > 0 }) EvictFromBrowser(response, host, browserHeld);
+    }
+
+    /// <summary>
+    /// Asks the browser to delete its own copy of a cookie the vault now holds.
+    ///
+    /// <para>Capturing a cookie from <c>Set-Cookie</c> stops it ever reaching the
+    /// browser — but only for cookies issued while the guard was running. One the
+    /// browser already had, from before the guard was ever turned on, stays in
+    /// the profile. Requests still go out with the vault's copy, because the
+    /// browser's is stripped, so everything works and looks protected while
+    /// <c>sessionid</c> sits on disk exactly where an infostealer reads it.</para>
+    ///
+    /// <para>The remedy is the mechanism the site itself would use: a
+    /// <c>Set-Cookie</c> with <c>Max-Age=0</c>, addressed to the same name,
+    /// domain and path the vault recorded. The scope has to match — a browser
+    /// matches a deletion on all three, so a wrong domain does not delete the
+    /// cookie, it creates a second empty one beside it.</para>
+    ///
+    /// <para>That failure is contained by accident of design: outbound stripping
+    /// works by name, so a stray empty cookie of the same name is removed from
+    /// the request as well and never reaches the site.</para>
+    ///
+    /// <para>Asked once per name per run. If the browser keeps sending it well
+    /// afterwards the deletion did not take, and that is said rather than
+    /// retried forever — an eviction that silently fails is the same silent hole
+    /// this exists to close.</para>
+    /// </summary>
+    private void EvictFromBrowser(HttpMessage response, string host,
+                                  IReadOnlyList<string> names)
+    {
+        var asked = new List<string>();
+        var stubborn = new List<string>();
+
+        foreach (string name in names)
+        {
+            string key = host + "\n" + name;
+            var now = DateTime.UtcNow;
+
+            if (_evicted.TryGetValue(key, out DateTime when))
+            {
+                // Still arriving a while after we asked: the browser did not
+                // honour it, and repeating will not change that.
+                if (now - when > TimeSpan.FromSeconds(30) &&
+                    _evicted.TryUpdate(key, DateTime.MaxValue, when))
+                    stubborn.Add(name);
+                continue;
+            }
+            if (!_evicted.TryAdd(key, now)) continue;
+
+            if (!_vault.TryGetScope(host, name, out string domain,
+                                    out bool hostOnly, out string path))
+                continue;
+
+            // Both shapes, deliberately. A request header carries only names —
+            // RFC 6265 sends no domain or path with them — so there is no way to
+            // learn how the browser's own copy is scoped. A host-only cookie and
+            // a domain cookie of the same name are different cookies and each
+            // needs its own deletion, and the browser's copy may well predate
+            // the vault's and be scoped differently.
+            //
+            // Sending both is safe here for a reason particular to this proxy:
+            // if one of them lands where no cookie exists it creates an empty
+            // one, and outbound stripping works by name, so that stray is
+            // removed from the next request and never reaches the site.
+            // Unconditionally both, including when the vault's own entry is
+            // host-only: what the vault recorded describes the cookie the
+            // *server* issued, and the copy still in the browser may be older
+            // and shaped differently. Measured, not assumed — a host-only
+            // deletion leaves a domain cookie of the same name untouched and
+            // vice versa, in every client tested.
+            Send($"{name}=; Max-Age=0; Path={path}; Secure; HttpOnly");
+            Send($"{name}=; Max-Age=0; Path={path}; Domain={domain}; Secure; HttpOnly");
+            if (!hostOnly && !domain.StartsWith('.'))
+                Send($"{name}=; Max-Age=0; Path={path}; Domain=.{domain}; Secure; HttpOnly");
+            if (path != "/")
+            {
+                Send($"{name}=; Max-Age=0; Path=/; Secure; HttpOnly");
+                Send($"{name}=; Max-Age=0; Path=/; Domain={domain}; Secure; HttpOnly");
+            }
+
+            asked.Add(name);
+
+            void Send(string attrs) =>
+                response.Head.Append(SetCookieHeader, Encoding.ASCII.GetBytes(attrs));
+        }
+
+        if (asked.Count > 0)
+            Emit("evict_from_browser", host,
+                 string.Join(",", asked) + " — the vault holds these; asking the " +
+                 "browser to drop its own copy");
+        if (stubborn.Count > 0)
+            Emit("eviction_ignored", host,
+                 string.Join(",", stubborn) + " — still in the browser profile " +
+                 "after the deletion was sent; these remain readable from disk");
     }
 }
